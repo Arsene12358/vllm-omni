@@ -162,6 +162,7 @@ async def test_audio_in_video_sets_mm_processor_kwargs():
         ws,
         config,
         [_b64(_make_jpeg())],
+        [],
         bytearray(b"\x00\x00"),
         [],
         "what is happening?",
@@ -199,6 +200,7 @@ async def test_audio_in_video_disabled_omits_mm_processor_kwargs():
         ws,
         config,
         [_b64(_make_jpeg())],
+        [],
         bytearray(b"\x00\x00"),
         [],
         "what is happening?",
@@ -322,6 +324,7 @@ async def test_async_chunk_mode_is_read_by_engine_path_at_runtime(monkeypatch):
         ws_on,
         config,
         [_b64(_make_jpeg())],
+        [],
         bytearray(),
         [],
         "describe",
@@ -337,6 +340,7 @@ async def test_async_chunk_mode_is_read_by_engine_path_at_runtime(monkeypatch):
         ws_off,
         config,
         [_b64(_make_jpeg())],
+        [],
         bytearray(),
         [],
         "describe",
@@ -356,6 +360,7 @@ async def test_query_without_engine_client_sends_error():
     await handler._process_query(
         ws,
         StreamingVideoSessionConfig(model="test"),
+        [],
         [],
         bytearray(),
         [],
@@ -492,6 +497,7 @@ async def test_client_cannot_send_internal_frame_decode_failed_message():
             websocket,
             config,
             frame_buffer,
+            sink_frames,
             audio_buffer,
             message_history,
             query_text,
@@ -585,6 +591,7 @@ async def test_audio_buffer_overflow_clears_buffer_before_query(monkeypatch):
             websocket,
             config,
             frame_buffer,
+            sink_frames,
             audio_buffer,
             message_history,
             query_text,
@@ -638,6 +645,7 @@ def test_build_messages_keeps_recent_history_text_only():
     messages, user_message = handler._build_messages(
         StreamingVideoSessionConfig(model="test", num_frames=1),
         [current_frame],
+        [],
         bytearray(),
         history,
         "current question",
@@ -648,3 +656,62 @@ def test_build_messages_keeps_recent_history_text_only():
     assert messages[1] == {"role": "assistant", "content": "recent answer"}
     assert messages[2] == user_message
     assert user_message["content"][-1] == {"type": "text", "text": "current question"}
+
+
+def _img_urls(user_message):
+    return [
+        c["image_url"]["url"].split(",", 1)[1]
+        for c in user_message["content"]
+        if c["type"] == "image_url"
+    ]
+
+
+def test_build_messages_prepends_sink_frames():
+    """B': pinned opening (sink) frames are prepended before the recent window."""
+    handler = OmniStreamingVideoHandler(chat_service=object())
+    sink0 = _b64(_make_jpeg(1, 1, 1))
+    sink1 = _b64(_make_jpeg(2, 2, 2))
+    recent = _b64(_make_jpeg(9, 9, 9))
+    _, user_message = handler._build_messages(
+        StreamingVideoSessionConfig(model="test", num_frames=1, sink_frames=2),
+        [recent],
+        [sink0, sink1],
+        bytearray(),
+        [],
+        "q",
+        {},
+    )
+    assert _img_urls(user_message) == [sink0, sink1, recent]
+
+
+def test_build_messages_sink_dedups_overlap_with_recent():
+    """A frame that is both a sink frame and in the recent window is sent once."""
+    handler = OmniStreamingVideoHandler(chat_service=object())
+    f0 = _b64(_make_jpeg(1, 1, 1))
+    f1 = _b64(_make_jpeg(2, 2, 2))
+    _, user_message = handler._build_messages(
+        StreamingVideoSessionConfig(model="test", num_frames=2, sink_frames=2),
+        [f0, f1],
+        [f0, f1],
+        bytearray(),
+        [],
+        "q",
+        {},
+    )
+    assert _img_urls(user_message) == [f0, f1]
+
+
+def test_build_messages_no_sink_is_unchanged():
+    """sink_frames=0 (default) preserves the current windowed behavior."""
+    handler = OmniStreamingVideoHandler(chat_service=object())
+    recent = _b64(_make_jpeg(7, 7, 7))
+    _, user_message = handler._build_messages(
+        StreamingVideoSessionConfig(model="test", num_frames=1),
+        [recent],
+        [],
+        bytearray(),
+        [],
+        "q",
+        {},
+    )
+    assert _img_urls(user_message) == [recent]

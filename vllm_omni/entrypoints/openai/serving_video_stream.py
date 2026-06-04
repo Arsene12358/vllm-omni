@@ -105,6 +105,15 @@ class StreamingVideoSessionConfig(BaseModel):
         le=1.0,
         description="EVS similarity threshold (higher = keep more frames).",
     )
+    sink_frames: int = Field(
+        default=0,
+        ge=0,
+        le=64,
+        description="StreamingLLM-style sink: pin the first N retained frames "
+        "(the stream's opening) and re-inject them into every query so the "
+        "model can always reference the opening even after the buffer churns "
+        "past max_frames. 0 (default) = current windowed behavior.",
+    )
 
 
 class OmniStreamingVideoHandler:
@@ -140,6 +149,9 @@ class OmniStreamingVideoHandler:
                 return
 
             frame_buffer: list[str] = []  # base64-encoded JPEG frames
+            # B' sink: the first `sink_frames` retained frames (the stream's
+            # opening), pinned and re-injected into every query. Never evicted.
+            sink_buffer: list[str] = []
             # Per-frame PIL cache + uuid for mm_hash reuse. Aligned with frame_buffer by index.
             frame_pil_cache: dict[str, tuple[Any, str] | object] = {}  # b64 -> (PIL.Image, uuid) or _BAD_FRAME
             frame_filter = (
@@ -255,8 +267,14 @@ class OmniStreamingVideoHandler:
                         max_buf = config.max_frames
                         if len(frame_buffer) >= max_buf:
                             dropped = frame_buffer.pop(0)
-                            frame_pil_cache.pop(dropped, None)
+                            # Keep the PIL/uuid cache entry alive if the dropped
+                            # frame is still pinned as a B' sink frame.
+                            if dropped not in sink_buffer:
+                                frame_pil_cache.pop(dropped, None)
                         frame_buffer.append(frame_data)
+                        # B' sink: pin the first `sink_frames` retained frames.
+                        if len(sink_buffer) < config.sink_frames:
+                            sink_buffer.append(frame_data)
                         # Prewarm: decode PIL off the event loop so query-time chat_template
                         # can skip base64+Image.open. uuid=md5 lets mm_cache dedupe identical frames.
                         if frame_data not in frame_pil_cache:
@@ -329,6 +347,7 @@ class OmniStreamingVideoHandler:
                         active_request_id = request_id
                         interrupt_event.clear()
                         query_frames = list(frame_buffer)
+                        query_sink = list(sink_buffer)  # B' pinned opening frames
                         query_audio_buffer = bytearray(audio_buffer)
                         audio_buffer.clear()
                         query_prewarmed_frames = dict(frame_pil_cache)
@@ -340,6 +359,7 @@ class OmniStreamingVideoHandler:
                                     websocket,
                                     config,
                                     query_frames,
+                                    query_sink,
                                     query_audio_buffer,
                                     message_history,
                                     query_text,
@@ -442,6 +462,7 @@ class OmniStreamingVideoHandler:
         websocket: WebSocket,
         config: StreamingVideoSessionConfig,
         frame_buffer: list[str],
+        sink_frames: list[str],
         audio_buffer: bytearray,
         message_history: list[dict[str, Any]],
         query_text: str,
@@ -459,6 +480,7 @@ class OmniStreamingVideoHandler:
             websocket,
             config,
             frame_buffer,
+            sink_frames,
             audio_buffer,
             message_history,
             query_text,
@@ -476,6 +498,7 @@ class OmniStreamingVideoHandler:
         websocket: WebSocket,
         config: StreamingVideoSessionConfig,
         frame_buffer: list[str],
+        sink_frames: list[str],
         audio_buffer: bytearray,
         message_history: list[dict[str, Any]],
         query_text: str,
@@ -491,6 +514,7 @@ class OmniStreamingVideoHandler:
         messages, user_message = self._build_messages(
             config,
             frame_buffer,
+            sink_frames,
             audio_buffer,
             message_history,
             query_text,
@@ -667,6 +691,7 @@ class OmniStreamingVideoHandler:
         self,
         config: StreamingVideoSessionConfig,
         frame_buffer: list[str],
+        sink_frames: list[str],
         audio_buffer: bytearray,
         message_history: list[dict[str, Any]],
         query_text: str,
@@ -679,11 +704,21 @@ class OmniStreamingVideoHandler:
         # Stride sampling (index 0 anchor, last slot = newest). Covers full buffer + stable mm_hash.
         n_buf = len(frame_buffer)
         if n_buf <= config.num_frames:
-            frames = list(frame_buffer)
+            recent = list(frame_buffer)
         else:
             stride = max(1, n_buf // config.num_frames)
             idx = [i * stride for i in range(config.num_frames - 1)] + [n_buf - 1]
-            frames = [frame_buffer[i] for i in idx]
+            recent = [frame_buffer[i] for i in idx]
+
+        # B' sink: prepend the pinned opening frames, then the recent window,
+        # de-duplicated (order-preserving) so a frame that is both a sink frame
+        # and a recent frame is sent only once (also avoids duplicate mm uuids).
+        seen: set[str] = set()
+        frames: list[str] = []
+        for fb in (sink_frames or []) + recent:
+            if fb not in seen:
+                seen.add(fb)
+                frames.append(fb)
 
         # Prefer prewarmed PIL + uuid so mm_cache can dedupe by hash.
         prewarmed = prewarmed_frames or {}
