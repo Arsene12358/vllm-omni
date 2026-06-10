@@ -18,6 +18,7 @@ from vllm_omni.entrypoints.openai import serving_video_stream, video_stream_envs
 from vllm_omni.entrypoints.openai.serving_video_stream import (
     OmniStreamingVideoHandler,
     StreamingVideoSessionConfig,
+    _TextStreamDemux,
 )
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -715,3 +716,270 @@ def test_build_messages_no_sink_is_unchanged():
         {},
     )
     assert _img_urls(user_message) == [recent]
+
+
+# ----------------------------------------------------------------------
+# Persistent streaming-LLM session (config.persistent=True)
+# ----------------------------------------------------------------------
+
+
+def _omni_text(cum: str, finish_reason: Any = None, ntok: int | None = None) -> OmniRequestOutput:
+    """Text OmniRequestOutput carrying cumulative text + finish_reason + token_ids."""
+
+    class Output:
+        pass
+
+    class RequestOutput:
+        pass
+
+    output = Output()
+    output.text = cum
+    output.finish_reason = finish_reason
+    output.token_ids = list(range(ntok if ntok is not None else len(cum.split())))
+    request_output = RequestOutput()
+    request_output.outputs = [output]
+    return OmniRequestOutput(final_output_type="text", request_output=request_output)
+
+
+def _feed_all(demux: _TextStreamDemux, seq: list[tuple]) -> list[tuple]:
+    events: list[tuple] = []
+    for cum, finish_reason, ntok in seq:
+        events.extend(demux.feed(cum, finish_reason, ntok))
+    return events
+
+
+def test_demux_discards_one_token_throwaway():
+    """An input-only chunk emits a 1-token throwaway — never surfaced."""
+    demux = _TextStreamDemux()
+    assert _feed_all(demux, [("x", "length", 1)]) == []
+
+
+def test_demux_emits_query_at_finish():
+    """In-progress (finish_reason=None) outputs emit nothing; the finished one emits once."""
+    demux = _TextStreamDemux()
+    events = _feed_all(
+        demux,
+        [
+            ("The", None, 1),
+            ("The cat", None, 2),
+            ("The cat sat", "stop", 3),
+        ],
+    )
+    assert events == [("start",), ("delta", "The cat sat"), ("done", "The cat sat")]
+
+
+def test_demux_query_in_single_finished_output():
+    """A query answer that arrives fully in one finished output (>1 token)."""
+    demux = _TextStreamDemux()
+    events = _feed_all(demux, [("hello there", "stop", 2)])
+    assert events == [("start",), ("delta", "hello there"), ("done", "hello there")]
+
+
+def test_demux_dedups_cumulative_reemit():
+    """A finished generation re-emitted (CUMULATIVE) is not sent twice."""
+    demux = _TextStreamDemux()
+    events = _feed_all(
+        demux,
+        [
+            ("a b", None, 2),
+            ("a b c", "stop", 3),
+            ("a b c", "stop", 3),  # re-emit
+            ("a b c", "stop", 3),  # re-emit
+        ],
+    )
+    assert events == [("start",), ("delta", "a b c"), ("done", "a b c")]
+
+
+def test_demux_throwaway_then_query_then_throwaway():
+    """Only the query between two throwaways produces a response."""
+    demux = _TextStreamDemux()
+    events = _feed_all(
+        demux,
+        [
+            ("z", "length", 1),  # throwaway
+            ("one", None, 1),
+            ("one two", "stop", 2),  # query
+            ("q", "length", 1),  # throwaway
+        ],
+    )
+    assert events == [("start",), ("delta", "one two"), ("done", "one two")]
+
+
+def test_demux_ignores_throwaways_interleaved_with_reemits():
+    """Regression (job 2074): the omni stream re-yields a finished answer once per
+    subsequent input chunk, interleaved with that chunk's 1-token throwaway. Neither
+    the throwaways nor the re-emits may produce duplicate or extra responses."""
+    demux = _TextStreamDemux()
+    events = _feed_all(
+        demux,
+        [
+            ("(a) X", "stop", 5),  # query 1 answer
+            ("tok", "length", 1),  # frame throwaway
+            ("(a) X", "stop", 5),  # re-emit after throwaway (the bug trigger)
+            ("tok2", "length", 1),  # throwaway
+            ("(a) X", "stop", 5),  # re-emit
+            ("(a) Y", "stop", 5),  # query 2 answer (different)
+            ("tok3", "length", 1),  # throwaway
+            ("(a) Y", "stop", 5),  # re-emit
+        ],
+    )
+    assert events == [
+        ("start",),
+        ("delta", "(a) X"),
+        ("done", "(a) X"),
+        ("start",),
+        ("delta", "(a) Y"),
+        ("done", "(a) Y"),
+    ]
+
+
+def test_persistent_config_defaults_off():
+    config = StreamingVideoSessionConfig(model="test")
+    assert config.persistent is False
+    assert config.refresh_at_position == 60000
+
+
+@pytest.mark.asyncio
+async def test_persistent_config_dispatches_to_persistent_session():
+    called = {}
+
+    class DispatchHandler(OmniStreamingVideoHandler):
+        async def _run_persistent_session(self, websocket, config):
+            called["persistent"] = config.persistent
+            await websocket.send_json({"type": "session.done"})
+
+    ws = MockWebSocket([json.dumps({"type": "session.config", "model": "test", "persistent": True})])
+    handler = DispatchHandler(chat_service=object(), engine_client=object())
+
+    await handler.handle_session(ws)
+
+    assert called.get("persistent") is True
+    assert any(m.get("type") == "session.done" for m in ws.sent)
+
+
+class _FakePersistentEngine:
+    """Drives the handler's per-epoch input stream and emits simulated outputs.
+
+    Consumes the ``prompt`` async generator (which pulls frames/queries from the
+    WS reader), recording each chunk. Query chunks (``max_tokens > 1``) emit a
+    cumulative multi-token answer; input-only chunks emit a 1-token throwaway.
+    """
+
+    def __init__(self, answer_tokens: list[str]):
+        self._answer = answer_tokens
+        self.epochs = 0
+        self.chunks: list[dict[str, Any]] = []
+
+    def generate(self, *, prompt, sampling_params=None, request_id="", output_modalities=None):
+        epoch = self.epochs
+        self.epochs += 1
+        chunks = self.chunks
+        answer = self._answer
+
+        async def _run():
+            async for chunk in prompt:
+                sp = chunk.sampling_params
+                chunks.append(
+                    {
+                        "epoch": epoch,
+                        "text": chunk.prompt["prompt"],
+                        "has_mm": "multi_modal_data" in chunk.prompt,
+                        "max_tokens": sp.max_tokens,
+                    }
+                )
+                if sp.max_tokens > 1:  # query chunk -> cumulative answer
+                    for i in range(len(answer)):
+                        cum = " ".join(answer[: i + 1])
+                        fr = "stop" if i == len(answer) - 1 else None
+                        yield _omni_text(cum, fr, i + 1)
+                else:  # input-only -> 1-token throwaway
+                    yield _omni_text("x", "length", 1)
+
+        return _run()
+
+
+@pytest.mark.asyncio
+async def test_persistent_session_streams_query_response():
+    engine = _FakePersistentEngine(["The", "cat", "sat"])
+    ws = TimedWebSocket()
+    handler = OmniStreamingVideoHandler(chat_service=object(), engine_client=engine, idle_timeout=5.0)
+    task = asyncio.create_task(handler.handle_session(ws))
+
+    ws.put(
+        {
+            "type": "session.config",
+            "model": "test",
+            "persistent": True,
+            "sink_frames": 1,
+            "num_frames": 2,
+            "refresh_at_position": 100000,
+        }
+    )
+    await asyncio.sleep(0)
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg(1, 1, 1))})
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg(2, 2, 2))})
+    await asyncio.sleep(0.05)
+    ws.put({"type": "video.query", "text": "what is happening?"})
+    await asyncio.sleep(0.05)
+    ws.put({"type": "video.done"})
+
+    await asyncio.wait_for(task, timeout=3.0)
+
+    types = ws.sent_types()
+    assert "response.start" in types
+    done = [m for m in ws.sent if m.get("type") == "response.text.done"]
+    assert done and done[-1]["text"] == "The cat sat"
+    assert "session.done" in types
+    assert engine.epochs == 1  # no refresh
+
+    # First chunk is the epoch-0 seed: chat preamble + frames, input-only.
+    assert engine.chunks[0]["text"].startswith("<|im_start|>system")
+    assert engine.chunks[0]["has_mm"] is True
+    assert engine.chunks[0]["max_tokens"] == 1
+    # The query opened the assistant turn with no video.
+    qchunks = [c for c in engine.chunks if c["max_tokens"] > 1]
+    assert qchunks and "<|im_start|>assistant" in qchunks[0]["text"]
+    assert qchunks[0]["has_mm"] is False
+
+
+@pytest.mark.asyncio
+async def test_persistent_session_refreshes_and_reseeds_opening(monkeypatch):
+    # Scale the per-chunk position estimate up so a couple of frames cross the
+    # (config-minimum) refresh threshold of 1024 -> forces a refresh in-test.
+    monkeypatch.setattr(serving_video_stream, "_PERSIST_EST_POS_PER_CHUNK", 700)
+    engine = _FakePersistentEngine(["A", "B", "C"])
+    ws = TimedWebSocket()
+    handler = OmniStreamingVideoHandler(chat_service=object(), engine_client=engine, idle_timeout=5.0)
+    task = asyncio.create_task(handler.handle_session(ws))
+
+    ws.put(
+        {
+            "type": "session.config",
+            "model": "test",
+            "persistent": True,
+            "sink_frames": 1,
+            "num_frames": 2,
+            "refresh_at_position": 1024,  # min allowed; ~2 chunks/epoch -> refresh
+        }
+    )
+    await asyncio.sleep(0)
+    for shade in range(1, 7):  # 6 distinct frames
+        ws.put({"type": "video.frame", "data": _b64(_make_jpeg(shade, shade, shade))})
+    await asyncio.sleep(0.1)
+    ws.put({"type": "video.query", "text": "what is happening?"})
+    await asyncio.sleep(0.1)
+    ws.put({"type": "video.done"})
+
+    await asyncio.wait_for(task, timeout=5.0)
+
+    assert engine.epochs >= 2  # at least one refresh occurred
+    # A refresh re-seed: an epoch>0 first carries the chat preamble + the pinned
+    # opening frames (so opening recall is preserved across the position wall).
+    reseeds = [
+        c for c in engine.chunks if c["epoch"] >= 1 and c["text"].startswith("<|im_start|>system") and c["has_mm"]
+    ]
+    assert reseeds
+    # The query is still answered (in whichever epoch reached it).
+    done = [m for m in ws.sent if m.get("type") == "response.text.done"]
+    assert done and done[-1]["text"] == "A B C"
+    assert "session.done" in ws.sent_types()
