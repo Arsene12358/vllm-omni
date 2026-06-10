@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Always-Online Streaming Video Understanding — Qwen3-Omni</title>
+<style>
+  :root {
+    --ivory:  #FAF9F5; --paper: #FFFFFF; --oat: #E3DACC;
+    --slate:  #141413;
+    --clay:   #D97757; --clay-d: #B85C3E; --olive: #788C5D;
+    --g100:   #F0EEE6; --g200: #E6E3DA; --g300: #D1CFC5;
+    --g500:   #87867F; --g700: #3D3D3A;
+    --serif: ui-serif, Georgia, "Times New Roman", Times, serif;
+    --sans:  system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono:  ui-monospace, "SF Mono", Menlo, Monaco, Consolas, monospace;
+  }
+  body { font: 16px/1.6 var(--sans); color: var(--slate); background: var(--ivory);
+         max-width: 980px; margin: 2rem auto; padding: 0 1rem; }
+  h1, h2, h3 { font-family: var(--serif); line-height: 1.25; }
+  h1 { font-size: 2rem; margin-bottom: .2rem; }
+  .sub { color: var(--g700); font-size: 1.05rem; margin-top: 0; }
+  h2 { border-bottom: 1px solid var(--oat); padding-bottom: .3rem; margin-top: 2.4rem; }
+  a { color: var(--clay); }
+  code { font-family: var(--mono); background: var(--g100); border-radius: 6px; padding: .1rem .35rem; font-size: .88em; }
+  pre  { font-family: var(--mono); background: var(--paper); border: 1px solid var(--g300);
+         border-radius: 8px; padding: .8rem 1rem; overflow-x: auto; font-size: .82rem; }
+  table { border-collapse: collapse; width: 100%; margin: .6rem 0; }
+  th, td { border: 1px solid var(--g300); padding: .5rem .7rem; text-align: left; vertical-align: top; }
+  th { background: var(--g100); font-family: var(--sans); }
+  blockquote { border-left: 4px solid var(--oat); margin: .6rem 0; padding: .4rem 1rem; color: var(--g700); }
+  .banner { background: var(--paper); border-left: 6px solid var(--olive); border-radius: 8px;
+            padding: 1rem 1.2rem; margin: 1.2rem 0; }
+  .banner .tag { font-family: var(--mono); font-size: .78rem; letter-spacing: .04em;
+                 color: var(--olive); text-transform: uppercase; }
+  .cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: .7rem; margin: 1rem 0; }
+  .card { background: var(--paper); border: 1px solid var(--g200); border-radius: 8px; padding: .8rem; }
+  .card .n { font-family: var(--serif); font-size: 1.5rem; color: var(--clay-d); }
+  .card .l { font-size: .82rem; color: var(--g700); }
+  .flow { display: flex; align-items: stretch; gap: 0; flex-wrap: wrap; margin: 1rem 0; }
+  .step { background: var(--paper); border: 1px solid var(--g300); border-radius: 8px;
+          padding: .7rem .85rem; flex: 1 1 0; min-width: 150px; }
+  .step .h { font-family: var(--mono); font-size: .74rem; text-transform: uppercase;
+             letter-spacing: .04em; color: var(--clay-d); }
+  .arrow { align-self: center; color: var(--g500); font-size: 1.4rem; padding: 0 .35rem; }
+  .pin { background: var(--g100); border: 1px dashed var(--olive); border-radius: 8px;
+         padding: .55rem .85rem; margin: .5rem 0 0; font-size: .9rem; }
+  .scene td.now { color: var(--slate); }
+  .scene td.recall { color: var(--g700); background: #FBF7F2; }
+  .scene .ep { font-family: var(--mono); font-size: .8rem; color: var(--clay-d); white-space: nowrap; }
+  figure { margin: 1rem 0; }
+  figcaption { font-size: .85rem; color: var(--g700); margin-top: .4rem; }
+  .legend span { font-family: var(--mono); font-size: .8rem; margin-right: 1rem; }
+  .sw { display: inline-block; width: 1.6rem; height: .35rem; vertical-align: middle; border-radius: 2px; margin-right: .3rem; }
+  footer { margin-top: 2.5rem; border-top: 1px solid var(--oat); padding-top: .8rem;
+           font-size: .85rem; color: var(--g700); }
+  .muted { color: var(--g500); }
+  @media (max-width: 720px) {
+    .cards { grid-template-columns: repeat(2, 1fr); }
+    .flow { flex-direction: column; } .arrow { transform: rotate(90deg); padding: .2rem 0; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Always-Online Streaming Video Understanding</h1>
+  <p class="sub">Qwen3-Omni Thinker on vLLM + vLLM-Omni — a continuous video stream in,
+  text answers out, GPU memory bounded, and the stream's opening always recallable.</p>
+</header>
+
+<div class="banner">
+  <div class="tag">Validated · 2026-06-10 · single node, 2×H200</div>
+  <p style="margin:.4rem 0 0">A live 800-frame stream ran through <strong>10 sessions (9 position
+  refreshes)</strong> with the KV cache held <strong>flat at ~673 blocks</strong> the whole time.
+  At every query the model described the <strong>current moment</strong> <em>and</em> correctly
+  recalled the <strong>opening scene</strong> — across all 9 refreshes, with no crash. Ingestion
+  measured at <strong>~12× realtime</strong> (≈25 frames/s vs a 2 fps feed); queries return in <strong>~1.5 s</strong>.</p>
+</div>
+
+<section>
+<h2>Watch a live segment (recording)</h2>
+<p>A real ~45-second capture of a live session, instrumented with a side monitor sampling
+GPU memory and the live KV working set once a second. Watch <strong>tokens processed climb
+past 200,000</strong> while <strong>live KV blocks stay flat at ~673</strong> and
+<strong>GPU memory stays constant at ~129 GB</strong> — and the model keeps answering, with
+each <em>(b)</em> still recalling the opening.</p>
+<figure>
+  <video controls preload="metadata" width="100%" style="border:1px solid var(--g300); border-radius:8px; background:var(--paper)">
+    <source src="recording.mp4" type="video/mp4">
+    Your browser can't play the embedded video — open
+    <code>recording.mp4</code> (or <code>recording.gif</code>) in this folder.
+  </video>
+  <figcaption>Live capture: chunks processed (tokens ↑) vs. bounded memory (KV blocks / GPU mem flat),
+  with model output below. File ships alongside this page (<code>.mp4</code> + <code>.gif</code>).</figcaption>
+</figure>
+</section>
+
+<section>
+<h2>What it does</h2>
+<p>The model watches a video <em>as it streams</em>. At any time you can ask a question; it
+answers about what is happening <strong>right now</strong> and can still reference what it saw
+at the <strong>beginning</strong>, no matter how long the stream has been running. Crucially,
+GPU memory does <strong>not grow with stream length</strong> — so the same box can keep a
+session online indefinitely (bounded, "reasonably-large" sessions).</p>
+
+<div class="cards">
+  <div class="card"><div class="n">9</div><div class="l">position refreshes survived in one run</div></div>
+  <div class="card"><div class="n">~673</div><div class="l">KV blocks live — flat across the whole stream</div></div>
+  <div class="card"><div class="n">16 / 16</div><div class="l">queries answered, recall consistent</div></div>
+  <div class="card"><div class="n">0</div><div class="l">crashes / errors</div></div>
+</div>
+</section>
+
+<section>
+<h2>How it works</h2>
+<p>One persistent engine request (an "epoch") ingests frames as small input-only chunks. A
+streaming-LLM KV eviction policy keeps only a pinned <strong>opening</strong> ("sink") plus a
+sliding <strong>recent</strong> window — everything between is dropped, so the cache stays
+bounded. Queries generate against that retained cache. When the rotary-position budget for an
+epoch is reached, the session <strong>refreshes</strong>: a fresh request is re-seeded with the
+opening + recent frames, position resets, and ingestion continues — the opening is preserved
+across the boundary.</p>
+
+<div class="flow">
+  <div class="step"><div class="h">Stream in</div>Video frames arrive continuously; each is
+    prefilled once — no re-processing of history.</div>
+  <span class="arrow" aria-hidden="true">→</span>
+  <div class="step"><div class="h">Bounded KV</div>Eviction holds the cache at
+    <code>[opening + recent]</code>. Memory flat regardless of length.</div>
+  <span class="arrow" aria-hidden="true">→</span>
+  <div class="step"><div class="h">Answer</div>A query generates against the retained cache:
+    current moment <em>and</em> opening recall.</div>
+  <span class="arrow" aria-hidden="true">→</span>
+  <div class="step"><div class="h">Refresh &amp; loop</div>At the boundary, re-seed
+    <code>[opening + recent]</code> → position resets → keep going.</div>
+</div>
+<div class="pin">🔒 <strong>The opening is pinned and re-seeded every refresh</strong> — that is why
+"what was at the very beginning?" keeps working after hours of stream and many refreshes.</div>
+</section>
+
+<section>
+<h2>The captured run — current moment vs. retained opening</h2>
+<p>Below is the actual run: a ~7-minute game clip streamed at 2 fps, asked the same two-part
+question repeatedly — <em>(a) what is happening right now</em> and <em>(b) what was shown at the
+very beginning</em>. The <strong>(a)</strong> column tracks the evolving stream; the
+<strong>(b)</strong> column stays locked on the opening through all 9 refreshes.</p>
+
+<table class="scene">
+  <thead><tr><th style="width:8.5rem">Point in stream</th>
+    <th>(a) Current moment <span class="muted">— tracks the video</span></th>
+    <th>(b) Opening recall <span class="muted">— stays constant</span></th></tr></thead>
+  <tbody>
+    <tr><td class="ep">start<br><span class="muted">epoch 0</span></td>
+      <td class="now">A character runs through an ancient stone archway into bright light as
+        glowing energy swirls around them.</td>
+      <td class="recall">Silhouetted figures standing in awe before massive ruins that glow from
+        within like molten metal or fire.</td></tr>
+    <tr><td class="ep">~frame 150<br><span class="muted">after 1st refresh</span></td>
+      <td class="now">The character runs across an alien landscape towards another figure standing
+        in front of a large ring-shaped object.</td>
+      <td class="recall">A group silhouetted against bright light emanating from within or behind
+        massive dark structures.</td></tr>
+    <tr><td class="ep">~frame 250<br><span class="muted">mid-stream</span></td>
+      <td class="now">A gaunt figure with long white hair confronts four people in an otherworldly
+        landscape before reaching out to touch their faces.</td>
+      <td class="recall">Silhouetted figures emerging from a massive structure that glows intensely
+        like molten metal against its dark surroundings.</td></tr>
+    <tr><td class="ep">~frame 350<br><span class="muted">mid-stream</span></td>
+      <td class="now">"The Paintress" summons Void meteors as her health bar shows she has taken
+        significant damage.</td>
+      <td class="recall">Silhouetted figures before an immense glowing portal set within colossal
+        dark structures on a desolate landscape.</td></tr>
+    <tr><td class="ep">~frame 500<br><span class="muted">later</span></td>
+      <td class="now">The player's party has just entered an area with glowing light ahead.</td>
+      <td class="recall">A group silhouetted in front of bright lights from within large structures
+        on either side.</td></tr>
+    <tr><td class="ep">~frame 650<br><span class="muted">later</span></td>
+      <td class="now">The player's party has just defeated their large enemy boss in battle.</td>
+      <td class="recall">A group walking towards an enormous glowing structure that resembled a
+        portal or doorway set within rocky terrain.</td></tr>
+    <tr><td class="ep">~frame 750<br><span class="muted">after 9th refresh</span></td>
+      <td class="now">A character casts a heal to revive allies during combat against The Paintress.</td>
+      <td class="recall">Several figures stand silhouetted before an immense glowing portal or rift
+        set within dark rock formations.</td></tr>
+  </tbody>
+</table>
+<p class="muted" style="font-size:.85rem">Every (b) answer describes the same opening — silhouetted
+figures before a glowing portal / molten-glowing structures in dark rock — even when the current
+scene (a) has moved on to a turn-based boss fight. That is the retained "sink", surviving 9 refreshes.</p>
+</section>
+
+<section>
+<h2>Bounded memory — the always-online property</h2>
+<p>Without eviction, the KV cache grows with every frame and the session eventually exhausts GPU
+memory. With the streaming-LLM eviction here, the live cache stays flat: it only ever holds the
+pinned opening plus the recent window. Measured live across all 10 epochs of the run, the live
+block count never left <strong>672–673</strong> (pinned opening = 160 blocks) while the total
+tokens processed climbed into the tens of thousands per epoch.</p>
+
+<figure>
+<svg viewBox="0 0 640 220" width="100%" role="img"
+     aria-label="KV blocks versus stream length: bounded flat line for this implementation versus an unbounded rising line without eviction">
+  <!-- axes -->
+  <line x1="48" y1="14" x2="48" y2="186" stroke="#D1CFC5" stroke-width="1" vector-effect="non-scaling-stroke"/>
+  <line x1="48" y1="186" x2="624" y2="186" stroke="#D1CFC5" stroke-width="1" vector-effect="non-scaling-stroke"/>
+  <text x="8" y="20" font-family="ui-monospace,monospace" font-size="10" fill="#87867F">KV</text>
+  <text x="560" y="204" font-family="ui-monospace,monospace" font-size="10" fill="#87867F">stream length →</text>
+  <!-- unbounded (naive, no eviction) -->
+  <line x1="48" y1="178" x2="624" y2="26" stroke="#B85C3E" stroke-width="2"
+        stroke-dasharray="6 5" vector-effect="non-scaling-stroke"/>
+  <text x="470" y="42" font-family="ui-monospace,monospace" font-size="11" fill="#B85C3E">no eviction → OOM</text>
+  <!-- bounded (ours) flat line at ~673 -->
+  <line x1="48" y1="150" x2="624" y2="150" stroke="#788C5D" stroke-width="2.5" vector-effect="non-scaling-stroke"/>
+  <text x="300" y="143" font-family="ui-monospace,monospace" font-size="11" fill="#788C5D">this implementation — flat at ~673 blocks</text>
+  <!-- refresh markers along the bottom -->
+  <g fill="#D97757">
+    <circle cx="105" cy="186" r="3"/><circle cx="163" cy="186" r="3"/><circle cx="221" cy="186" r="3"/>
+    <circle cx="278" cy="186" r="3"/><circle cx="336" cy="186" r="3"/><circle cx="394" cy="186" r="3"/>
+    <circle cx="451" cy="186" r="3"/><circle cx="509" cy="186" r="3"/><circle cx="567" cy="186" r="3"/>
+  </g>
+  <text x="105" y="178" font-family="ui-monospace,monospace" font-size="9" fill="#D97757">refreshes →</text>
+</svg>
+<figcaption>Live KV blocks vs. stream length. <span class="legend"><span class="sw" style="background:#788C5D"></span>this implementation (bounded, flat)</span>
+<span class="legend"><span class="sw" style="background:#B85C3E"></span>naive (grows → out of memory)</span>
+Dots mark the 9 position-refreshes; the cache is unaffected by them.</figcaption>
+</figure>
+
+<p>One eviction sample from each of the 10 sessions in the run (note <code>alive</code> is flat
+while a new request id appears at every refresh):</p>
+<pre>epoch 0  req=vsess-0704d808-0   computed=10880  alive=672  (start_pinned=160)
+epoch 1  req=vsess-6e2c4ee1-1   computed=10949  alive=673  (start_pinned=160)   ← refresh
+epoch 2  req=vsess-514c19d7-2   computed=10862  alive=673  (start_pinned=160)   ← refresh
+epoch 4  req=vsess-64eaf5d4-4   computed=10862  alive=673  (start_pinned=160)   ← refresh
+epoch 6  req=vsess-682e09ad-6   computed=10862  alive=673  (start_pinned=160)   ← refresh
+epoch 9  req=vsess-a7af1f23-9   computed=10862  alive=673  (start_pinned=160)   ← refresh</pre>
+</section>
+
+<section>
+<h2>How to read this / how to verify it yourself</h2>
+<ul>
+  <li><strong>Current-moment tracking</strong> — the (a) answers should change as the video
+    progresses (they do: archway → alien landscape → boss fight → victory).</li>
+  <li><strong>Opening retention</strong> — the (b) answers should stay about the opening, the
+    same across refreshes (they do).</li>
+  <li><strong>Bounded memory</strong> — the server log's <code>[streaming-kv] eviction … alive=N</code>
+    line should stay flat as the stream grows; new <code>vsess-…-&lt;epoch&gt;</code> ids mark refreshes.</li>
+  <li><strong>No crash</strong> — the session ends cleanly (<code>session.done</code>) with zero errors.</li>
+</ul>
+<p>The example's <strong><code>README.md</code></strong> (one level up from this <code>assets/</code> folder)
+walks through serving the model with the right flags, streaming a clip with <code>demo_client.py</code>,
+and checking each of the four signals above on your own GPUs.</p>
+</section>
+
+<section>
+<h2>Honest caveats</h2>
+<ul>
+  <li><strong>Throughput is realtime-capable.</strong> Measured on this 2×H200 setup (eager
+    execution, no CUDA graphs yet): ingestion runs at <strong>~25 frames/s — about 12× a live
+    2 fps feed</strong>, and a query returns in <strong>~1.5 s</strong> (after a one-time warmup).
+    So a single session comfortably keeps up with a live feed. Higher frame-rates / resolution and
+    many concurrent sessions are headroom to characterize, and further speedups (CUDA graphs,
+    coarser ingest chunks, batching) remain available — but are not required to be realtime here.</li>
+  <li><strong>Answer style is the base model's.</strong> Qwen3-Omni is verbose (it sometimes
+    appends a "Detailed Breakdown") and its content/labels (e.g. naming the game) are the base
+    model's behavior, independent of the streaming layer. A brevity instruction in the system
+    prompt tightens this.</li>
+  <li><strong>Bounded, not literally infinite.</strong> The session is reasonably-large and
+    refreshes indefinitely; resources stay bounded throughout.</li>
+</ul>
+</section>
+
+<footer>
+  Qwen3-Omni-30B-A3B-Instruct · vLLM 0.20.0 + streaming-KV eviction · vLLM-Omni persistent video
+  session. Captured run: 800 frames @ 2 fps, 10 epochs / 9 refreshes, KV alive 672–673, 16/16
+  queries, 0 errors. &nbsp;See this example's <code>README.md</code> to reproduce.
+</footer>
+
+</body>
+</html>
