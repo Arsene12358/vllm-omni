@@ -169,39 +169,49 @@ class StreamingVideoSessionConfig(BaseModel):
 
 
 class _TextStreamDemux:
-    """Demux a persistent streaming session's text output into per-query responses.
+    """Stream a persistent session's text output as incremental deltas, robust to the
+    omni orchestrator stream:
 
-    Per-output classification, robust to the omni orchestrator stream:
-    - Input-only frame chunks (``max_tokens=1``) emit a 1-token throwaway. Ignored
-      entirely (``ntok <= 1``) so they never disturb query tracking.
-    - After a query finishes, the omni engine re-yields that finished answer once
-      per subsequent input chunk (the per-request detokenizer text is unchanged).
-      Dedup those by full-answer equality against the last delivered answer — NOT
-      by a rolling token, since the interleaved throwaways would defeat that.
-    - A query answer is a finished (``finish_reason is not None``), multi-token,
-      non-empty generation whose text differs from the last delivered answer.
+    - Input-only frame chunks emit empty-text outputs -> ignored.
+    - With session pacing a query generates cleanly: the cumulative text grows
+      token by token (``finish_reason`` None) until the final token, so we emit a
+      ``delta`` per growth and ``done`` at the finish.
+    - A finished answer may be re-yielded by the engine -> deduped against the last
+      delivered answer.
 
-    Emitted at finish granularity (``start`` + one ``delta`` + ``done``); the user
-    deferred incremental token streaming to the realtime-perf milestone.
+    The handler additionally gates these events to one answer per query (so any
+    post-answer re-emit is dropped upstream regardless).
 
     ``feed(cum_text, finish_reason, ntok)`` returns events, each one of
     ``("start",)``, ``("delta", text)``, ``("done", text)``.
     """
 
     def __init__(self) -> None:
-        self._last_answer: str | None = None  # last fully-delivered query answer (dedup)
+        self._cur = ""  # cumulative text already streamed for the in-flight answer
+        self._open = False  # response.start emitted for the in-flight answer
+        self._last_answer: str | None = None  # last fully-delivered answer (dedup re-emits)
 
     def feed(self, cum: str, finish_reason: Any, ntok: int) -> list[tuple]:
         cum = cum or ""
-        # Only a finished, real (multi-token), non-empty generation that differs
-        # from the last delivered answer is a query response; everything else
-        # (throwaways, re-emits, in-progress outputs) is ignored.
-        if finish_reason is None or ntok <= 1 or not cum.strip():
-            return []
-        if cum == self._last_answer:
-            return []
-        self._last_answer = cum
-        return [("start",), ("delta", cum), ("done", cum)]
+        if not cum.strip():
+            return []  # input-only / empty output -> ignore
+        events: list[tuple] = []
+        if not self._open:
+            if cum == self._last_answer:
+                return []  # re-emit of the delivered answer -> ignore
+            self._open = True
+            self._cur = ""
+            events.append(("start",))
+        delta = cum[len(self._cur) :] if cum.startswith(self._cur) else cum
+        if delta:
+            events.append(("delta", delta))
+        self._cur = cum
+        if finish_reason is not None:
+            events.append(("done", cum))
+            self._last_answer = cum
+            self._open = False
+            self._cur = ""
+        return events
 
 
 class OmniStreamingVideoHandler:

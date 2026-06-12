@@ -748,14 +748,14 @@ def _feed_all(demux: _TextStreamDemux, seq: list[tuple]) -> list[tuple]:
     return events
 
 
-def test_demux_discards_one_token_throwaway():
-    """An input-only chunk emits a 1-token throwaway — never surfaced."""
+def test_demux_ignores_empty_input_chunk_outputs():
+    """Input-only frame chunks emit empty-text outputs — never surfaced."""
     demux = _TextStreamDemux()
-    assert _feed_all(demux, [("x", "length", 1)]) == []
+    assert _feed_all(demux, [("", "length", 5), ("", "length", 9)]) == []
 
 
-def test_demux_emits_query_at_finish():
-    """In-progress (finish_reason=None) outputs emit nothing; the finished one emits once."""
+def test_demux_streams_query_token_by_token():
+    """A query streams as incremental deltas, then done with the full text."""
     demux = _TextStreamDemux()
     events = _feed_all(
         demux,
@@ -765,71 +765,62 @@ def test_demux_emits_query_at_finish():
             ("The cat sat", "stop", 3),
         ],
     )
-    assert events == [("start",), ("delta", "The cat sat"), ("done", "The cat sat")]
+    assert events == [
+        ("start",),
+        ("delta", "The"),
+        ("delta", " cat"),
+        ("delta", " sat"),
+        ("done", "The cat sat"),
+    ]
 
 
 def test_demux_query_in_single_finished_output():
-    """A query answer that arrives fully in one finished output (>1 token)."""
+    """A query answer that arrives fully in one finished output."""
     demux = _TextStreamDemux()
     events = _feed_all(demux, [("hello there", "stop", 2)])
     assert events == [("start",), ("delta", "hello there"), ("done", "hello there")]
 
 
-def test_demux_dedups_cumulative_reemit():
-    """A finished generation re-emitted (CUMULATIVE) is not sent twice."""
+def test_demux_dedups_reemit_after_done():
+    """A finished answer that the engine re-yields is not streamed again."""
     demux = _TextStreamDemux()
     events = _feed_all(
         demux,
         [
-            ("a b", None, 2),
-            ("a b c", "stop", 3),
-            ("a b c", "stop", 3),  # re-emit
-            ("a b c", "stop", 3),  # re-emit
+            ("a", None, 1),
+            ("a b", "stop", 2),
+            ("a b", "stop", 2),  # re-emit
+            ("a b", "stop", 2),  # re-emit
         ],
     )
-    assert events == [("start",), ("delta", "a b c"), ("done", "a b c")]
+    assert events == [("start",), ("delta", "a"), ("delta", " b"), ("done", "a b")]
 
 
-def test_demux_throwaway_then_query_then_throwaway():
-    """Only the query between two throwaways produces a response."""
+def test_demux_empty_throwaways_and_reemits_between_queries():
+    """Empty input-chunk outputs and a re-yielded finished answer between two queries
+    must not leak; each query streams exactly once."""
     demux = _TextStreamDemux()
     events = _feed_all(
         demux,
         [
-            ("z", "length", 1),  # throwaway
-            ("one", None, 1),
-            ("one two", "stop", 2),  # query
-            ("q", "length", 1),  # throwaway
-        ],
-    )
-    assert events == [("start",), ("delta", "one two"), ("done", "one two")]
-
-
-def test_demux_ignores_throwaways_interleaved_with_reemits():
-    """Regression (job 2074): the omni stream re-yields a finished answer once per
-    subsequent input chunk, interleaved with that chunk's 1-token throwaway. Neither
-    the throwaways nor the re-emits may produce duplicate or extra responses."""
-    demux = _TextStreamDemux()
-    events = _feed_all(
-        demux,
-        [
-            ("(a) X", "stop", 5),  # query 1 answer
-            ("tok", "length", 1),  # frame throwaway
-            ("(a) X", "stop", 5),  # re-emit after throwaway (the bug trigger)
-            ("tok2", "length", 1),  # throwaway
-            ("(a) X", "stop", 5),  # re-emit
-            ("(a) Y", "stop", 5),  # query 2 answer (different)
-            ("tok3", "length", 1),  # throwaway
-            ("(a) Y", "stop", 5),  # re-emit
+            ("(a) X", None, 2),
+            ("(a) X done", "stop", 4),  # query 1 streams to done
+            ("", "length", 6),  # empty throwaway
+            ("(a) X done", "stop", 4),  # re-emit of the delivered answer -> ignored
+            ("", "length", 7),  # empty throwaway
+            ("(a) Y", None, 2),
+            ("(a) Y done", "stop", 4),  # query 2 streams
         ],
     )
     assert events == [
         ("start",),
         ("delta", "(a) X"),
-        ("done", "(a) X"),
+        ("delta", " done"),
+        ("done", "(a) X done"),
         ("start",),
         ("delta", "(a) Y"),
-        ("done", "(a) Y"),
+        ("delta", " done"),
+        ("done", "(a) Y done"),
     ]
 
 
@@ -862,7 +853,7 @@ class _FakePersistentEngine:
 
     Consumes the ``prompt`` async generator (which pulls frames/queries from the
     WS reader), recording each chunk. Query chunks (``max_tokens > 1``) emit a
-    cumulative multi-token answer; input-only chunks emit a 1-token throwaway.
+    cumulative multi-token answer; input-only chunks emit an empty-text throwaway.
     """
 
     def __init__(self, answer_tokens: list[str]):
@@ -892,8 +883,8 @@ class _FakePersistentEngine:
                         cum = " ".join(answer[: i + 1])
                         fr = "stop" if i == len(answer) - 1 else None
                         yield _omni_text(cum, fr, i + 1)
-                else:  # input-only -> 1-token throwaway
-                    yield _omni_text("x", "length", 1)
+                else:  # input-only -> empty-text throwaway (as the real engine emits)
+                    yield _omni_text("", "length", 1)
 
         return _run()
 
