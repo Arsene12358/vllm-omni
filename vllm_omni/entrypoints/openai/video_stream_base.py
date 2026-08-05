@@ -149,6 +149,32 @@ class StreamingVideoSessionConfig(BaseModel):
         le=1.0,
         description="EVS similarity threshold (higher = keep more frames).",
     )
+    sink_frames: int = Field(
+        default=0,
+        ge=0,
+        le=64,
+        description="StreamingLLM-style sink: pin the first N retained frames "
+        "(the stream's opening) and re-inject them into every query so the "
+        "model can always reference the opening even after the buffer churns "
+        "past max_frames. 0 (default) = current windowed behavior.",
+    )
+    persistent: bool = Field(
+        default=False,
+        description="Persistent streaming-LLM session: instead of a fresh "
+        "re-injection request per query, drive ONE engine streaming request "
+        "that ingests frames as input-only chunks (KV retained, no per-query "
+        "re-prefill) and refreshes at the M-RoPE position boundary by "
+        "re-seeding [sink+recent] into a new request. False (default) = "
+        "windowed re-injection (the shipped fallback).",
+    )
+    refresh_at_position: int = Field(
+        default=60000,
+        ge=1024,
+        le=262144,
+        description="Persistent mode only: estimated M-RoPE position at which "
+        "to refresh (re-seed). Kept below the trained-range wall (65536). The "
+        "handler estimates position from ingested chunks (~spatial-tax/chunk).",
+    )
 
 
 class OmniStreamingVideoHandler:
