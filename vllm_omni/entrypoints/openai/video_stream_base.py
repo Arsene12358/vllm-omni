@@ -242,6 +242,15 @@ class OmniStreamingVideoHandler:
             if config is None:
                 return
 
+            if config.persistent:
+                # Imported lazily: the persistent driver imports this module for
+                # the shared limits/decode helper, so a top-level import here
+                # would be circular.
+                from vllm_omni.entrypoints.openai import video_stream_persistent
+
+                await video_stream_persistent.run_persistent_session(self, websocket, config)
+                return
+
             frame_buffer: list[str] = []  # base64-encoded JPEG frames
             frame_metadata: list[dict[str, Any]] = []
             # Per-frame PIL cache + uuid for mm_hash reuse. Aligned with frame_buffer by index.
