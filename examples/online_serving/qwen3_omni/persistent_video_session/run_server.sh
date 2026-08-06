@@ -22,8 +22,15 @@ export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 # NOTE: do NOT pass --tensor-parallel-size. The omni server places each stage on its
 # own GPU (thinker -> cuda:0, talker/code2wav -> cuda:1); forcing TP makes a stage
 # demand 2 visible devices when it only sees 1 and the server aborts at startup.
+#
+# NOTE: CUDA graphs (the default — no --enforce-eager) is the validated production
+# config. If you must run eager: eager + the default async scheduling wedges
+# persistent streaming sessions. Set `async_scheduling: false` on stages 0/1 through
+# a deploy config (--deploy-config <yaml>) — the --no-async-scheduling CLI flag is
+# NOT sufficient (it flips the engine arg but leaves the async scheduler class
+# resolved from the deploy YAML). See README "Troubleshooting".
 vllm serve "$MODEL" --omni --port "$PORT" \
-  --trust-remote-code --enforce-eager --max-num-seqs 1 \
+  --trust-remote-code --max-num-seqs 1 \
   --max-model-len 65536 \
   --streaming-kv-start-size 2560 --streaming-kv-recent-size 8192 \
   --limit-mm-per-prompt '{"video": 256}'

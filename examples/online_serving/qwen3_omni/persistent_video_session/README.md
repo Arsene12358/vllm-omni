@@ -30,13 +30,20 @@ stack — see the validation report until it lands).
 | 3 | **Bounded memory** — KV `alive=N` stays flat while the stream grows | server log |
 | 4 | **No crash** — clean `session.done`, refreshes appear as new request ids | client + server log |
 
-Measured on 2×H200 (eager):
+Measured on 2×H200 (800-frame session, queries every 50 frames; S2 = eager run,
+S3 = CUDA-graphs run of the v0.26.0 validation):
 
 | Metric | old branch (v0.20-era) | this port (v0.26.0) |
 |--------|------------------------|---------------------|
-| ingestion | ~25 frames/s (**~12× a live 2 fps feed**) | (re-measured in S2/S3 — see validation report) |
-| query latency | ~1.5 s | (re-measured in S2/S3 — see validation report) |
-| KV `alive` | 672–673 | (re-measured in S2/S3 — see validation report) |
+| ingestion (session e2e incl. answers) | ~25 frames/s (**~12× a live 2 fps feed**) | **25.5 frames/s** graphs / ~13 frames/s eager |
+| query cycle (50-frame ingest + answer) | ~1.5 s query latency | **~1.4 s** graphs / 2.8–4.3 s eager |
+| decode | ~35 tok/s eager → ~199 tok/s graphs | 26.5 tok/s eager → **213 tok/s** graphs (per-answer median) |
+| KV `alive` | 672–673 | **672–673** (flat across 10 epochs) |
+| server ready | — | 182 s eager / **222 s** graphs (torch.compile ~39 s + capture ≤2 s per stage) |
+
+A single server also sustains **concurrent** persistent sessions once
+`--max-num-seqs` is raised (validated up to 8 streams; see the validation
+report's S4 scaling table).
 
 ## Requirements
 
@@ -69,7 +76,8 @@ Measured on 2×H200 (eager):
 ```bash
 # 1) serve (one terminal)
 MODEL=Qwen/Qwen3-Omni-30B-A3B-Instruct PORT=8901 ./run_server.sh
-# wait until http://localhost:8901/v1/models returns a model id (first load ~2-3 min)
+# wait until http://localhost:8901/v1/models returns a model id
+# (first load ~4 min: weights + torch.compile + CUDA-graph capture)
 
 # 2) stream a clip + ask questions (another terminal)
 python demo_client.py --video your_clip.mp4 --port 8901 \
@@ -106,11 +114,20 @@ memory stay flat, with the model's answers and refresh markers. Needs `ffmpeg` +
 | `num_frames` (`--recent`) | session config | recent frames re-seeded at a refresh for continuity |
 | `refresh_at_position` (`--refresh-at`, ≥1024) | session config | larger → longer epochs / fewer refreshes (keep epoch tokens < `max-model-len`) |
 | `--streaming-kv-start-size` / `-recent-size` | server | KV tokens pinned (opening) / kept (recent) — the memory bound |
+| `--max-num-seqs` | server | concurrent persistent sessions per server; the demo default `1` keeps single-viewer latency, `8` validated with 8 concurrent streams on 2×H200 (each stream keeps its own flat 672–673 KV band) |
 | `system_prompt` (`--brief`) | session config | brevity instruction for clean two-sentence answers |
 | `persistent: false` | session config | the original windowed re-injection handler (unchanged) |
 
 ## Troubleshooting
 
+- **Streaming session wedges mid-stream under `--enforce-eager`** — eager + the default
+  async scheduling is a broken combination for persistent streaming sessions. If you must
+  run eager, set `async_scheduling: false` on stages 0 and 1 **through a deploy config**
+  (`--deploy-config your.yaml`): the deploy value picks the sync scheduler class and the
+  engine arg together. The `--no-async-scheduling` CLI flag is **not** sufficient — it
+  flips only the engine arg while the stage keeps the async scheduler class resolved from
+  the deploy YAML (an untested mismatch). The default CUDA-graphs config (this
+  `run_server.sh`) needs no override.
 - **Server aborts with `local_world_size (2) > visible devices (1)`** — you passed
   `--tensor-parallel-size`; remove it (the omni server self-places stages).
 - **Queries return one word / stop immediately** — the vLLM-core `max_tokens` scheduler
