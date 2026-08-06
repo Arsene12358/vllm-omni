@@ -789,3 +789,77 @@ async def test_query_before_any_frame_reports_no_frames_buffered():
     assert {"type": "error", "message": "No frames buffered"} in ws.sent
     assert engine.chunks[0]["text"] == _SEED_PREFIX + _VID_BLOCK
     assert "session.done" in ws.sent_types()
+
+
+class HangingEngineClient:
+    """Engine that drains the input stream but never ends the output stream.
+
+    Mirrors the S2 session-close hang: the terminal output for the final
+    ``resumable=False`` sentinel never reaches the client, so ``generate()``'s
+    async-for never finishes.
+    """
+
+    def __init__(self) -> None:
+        self.drained = asyncio.Event()
+        self.epochs = 0
+
+    def generate(self, *, prompt, sampling_params=None, request_id="", output_modalities=None):
+        self.epochs += 1
+
+        async def _run():
+            async def _drain() -> None:
+                async for _chunk in prompt:
+                    pass
+                self.drained.set()
+
+            task = asyncio.create_task(_drain())
+            try:
+                await asyncio.sleep(3600)  # terminal output never arrives
+                yield  # pragma: no cover - unreachable, keeps _run an async generator
+            finally:
+                task.cancel()
+
+        return _run()
+
+
+@pytest.mark.asyncio
+async def test_stream_end_guard_closes_session_when_engine_never_terminates(monkeypatch, caplog):
+    """A dropped engine terminal must degrade to a warning + `session.done`."""
+    monkeypatch.setattr(video_stream_persistent, "_PERSIST_STREAM_END_TIMEOUT", 0.2)
+    engine = HangingEngineClient()
+    ws = TimedWebSocket()
+    handler = _persistent_handler(engine)
+    task = asyncio.create_task(handler.handle_session(ws))
+
+    ws.put(_config_msg())
+    await asyncio.sleep(0)
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg(10))})
+    await _settle(ws)
+    with caplog.at_level("WARNING"):
+        ws.put({"type": "video.done"})
+        await asyncio.wait_for(task, timeout=5.0)
+
+    assert engine.drained.is_set()  # the epoch generator did complete
+    assert "session.done" in ws.sent_types()
+    assert "error" not in ws.sent_types()
+    assert any("engine stream did not end" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_stream_end_guard_does_not_fire_on_a_clean_close(caplog):
+    """The guard is belt-and-braces: a healthy engine closes before it can fire."""
+    engine = FakeEngineClient(["ok"])
+    ws = TimedWebSocket()
+    handler = _persistent_handler(engine)
+    task = asyncio.create_task(handler.handle_session(ws))
+
+    ws.put(_config_msg())
+    await asyncio.sleep(0)
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg(10))})
+    await _settle(ws)
+    with caplog.at_level("WARNING"):
+        ws.put({"type": "video.done"})
+        await asyncio.wait_for(task, timeout=5.0)
+
+    assert "session.done" in ws.sent_types()
+    assert not any("engine stream did not end" in r.getMessage() for r in caplog.records)

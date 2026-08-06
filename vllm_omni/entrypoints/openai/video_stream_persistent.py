@@ -55,6 +55,12 @@ _PERSIST_QUERY_REPETITION_PENALTY = 1.3
 # the in-flight token, truncating the answer). Resume on the response, or after
 # this safety timeout (generation is slow under enforce_eager).
 _PERSIST_QUERY_RESPONSE_TIMEOUT = 120.0
+# Defense in depth. Once an epoch's input stream closes, the engine owes the
+# session a terminal output; without it the client would wait for its own recv
+# timeout (600 s in the example client). Bound that tail so a dropped engine
+# terminal degrades to a logged warning plus a normal `session.done` instead of
+# a hung client. Generous vs. the observed answer decode times (<= 3 s).
+_PERSIST_STREAM_END_TIMEOUT = 30.0
 # Open-loop M-RoPE position estimate. ~40 positions per 2-frame chunk at ~640px /
 # 2fps (measured: position ~= 0.056 x tokens, job 2051). Spatial tax dominates per
 # chunk, so we estimate per chunk rather than per token; conservative so refresh
@@ -392,35 +398,66 @@ async def run_persistent_session(
 
         return gen()
 
+    async def _tracked_epoch_input_stream(epoch: int, inputs_done: asyncio.Event):
+        """Epoch input stream that flags when the engine has drained it."""
+        try:
+            async for chunk in _epoch_input_stream(epoch):
+                yield chunk
+        finally:
+            inputs_done.set()
+
+    async def _consume_epoch(result_gen, demux: _TextStreamDemux) -> None:
+        async for output in result_gen:
+            if not isinstance(output, OmniRequestOutput):
+                continue
+            state = _text_output_state(output)
+            if state is None:
+                continue
+            cum, finish_reason, ntok = state
+            for ev in demux.feed(cum, finish_reason, ntok):
+                # Deliver exactly one answer per query; suppress trailing
+                # re-emits / degeneration once the answer is delivered.
+                if not expecting_answer["v"]:
+                    continue
+                if ev[0] == "done":
+                    expecting_answer["v"] = False
+                    query_done_event.set()  # unblock ingestion (pacing)
+                await _emit_demux_event(websocket, ev)
+
     reader_task = asyncio.create_task(_reader())
     epoch = 0
     try:
         while not done_event.is_set():
             demux = _TextStreamDemux()  # fresh per epoch (new request_id)
             request_id = f"vsess-{uuid.uuid4().hex[:8]}-{epoch}"
+            inputs_done = asyncio.Event()
             try:
                 result_gen = handler._engine_client.generate(
-                    prompt=_epoch_input_stream(epoch),
+                    prompt=_tracked_epoch_input_stream(epoch, inputs_done),
                     sampling_params=default_sp,
                     request_id=request_id,
                     output_modalities=["text"],
                 )
-                async for output in result_gen:
-                    if not isinstance(output, OmniRequestOutput):
-                        continue
-                    state = _text_output_state(output)
-                    if state is None:
-                        continue
-                    cum, finish_reason, ntok = state
-                    for ev in demux.feed(cum, finish_reason, ntok):
-                        # Deliver exactly one answer per query; suppress trailing
-                        # re-emits / degeneration once the answer is delivered.
-                        if not expecting_answer["v"]:
-                            continue
-                        if ev[0] == "done":
-                            expecting_answer["v"] = False
-                            query_done_event.set()  # unblock ingestion (pacing)
-                        await _emit_demux_event(websocket, ev)
+                consume_task = asyncio.create_task(_consume_epoch(result_gen, demux))
+                inputs_task = asyncio.create_task(inputs_done.wait())
+                try:
+                    await asyncio.wait({consume_task, inputs_task}, return_when=asyncio.FIRST_COMPLETED)
+                    if consume_task.done():
+                        await consume_task
+                    else:
+                        # The input stream closed, so the engine owes a terminal
+                        # output; bound that wait rather than trusting it.
+                        await asyncio.wait_for(consume_task, timeout=_PERSIST_STREAM_END_TIMEOUT)
+                finally:
+                    inputs_task.cancel()
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "persistent session epoch %d: engine stream did not end within %.0fs of the "
+                    "input stream closing (dropped terminal output); closing the session anyway",
+                    epoch,
+                    _PERSIST_STREAM_END_TIMEOUT,
+                )
+                break
             except Exception:
                 logger.exception("Persistent session epoch %d failed", epoch)
                 await handler._send_error(websocket, "Persistent session epoch failed")
