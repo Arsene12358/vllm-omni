@@ -17,6 +17,7 @@ import re
 from typing import Any
 
 import pytest
+from fastapi import WebSocketDisconnect
 from PIL import Image
 from pydantic import ValidationError
 
@@ -296,6 +297,7 @@ class FakeEngineClient:
         self._after_answer = after_answer or []
         self._fail = fail
         self.epochs = 0
+        self.aborted = False  # result stream closed before it was drained
         self.calls: list[dict[str, Any]] = []
         self.chunks: list[dict[str, Any]] = []
 
@@ -357,6 +359,11 @@ class FakeEngineClient:
                     if gated and self._answer_gate is not None:
                         await self._answer_gate.hold()
                     yield output
+            except GeneratorExit:
+                # The driver closed the stream mid-epoch; the real AsyncOmni
+                # aborts its internal requests on exactly this signal.
+                self.aborted = True
+                raise
             finally:
                 task.cancel()
 
@@ -862,4 +869,79 @@ async def test_stream_end_guard_does_not_fire_on_a_clean_close(caplog):
         await asyncio.wait_for(task, timeout=5.0)
 
     assert "session.done" in ws.sent_types()
+    assert not any("engine stream did not end" in r.getMessage() for r in caplog.records)
+
+
+class DisconnectingWebSocket(TimedWebSocket):
+    """Client that vanishes mid-answer: the socket dies after N deltas.
+
+    Once dead every send raises, which is what starlette does after the peer
+    closes the connection.
+    """
+
+    def __init__(self, fail_after_deltas: int = 1):
+        super().__init__()
+        self._fail_after = fail_after_deltas
+        self._deltas = 0
+        self.dead = False
+
+    async def send_json(self, data: dict[str, Any]):
+        if self.dead:
+            raise WebSocketDisconnect(code=1001)
+        if data.get("type") == "response.text.delta":
+            self._deltas += 1
+            if self._deltas >= self._fail_after:
+                self.dead = True
+                raise WebSocketDisconnect(code=1001)
+        await super().send_json(data)
+
+
+@pytest.mark.asyncio
+async def test_client_disconnect_mid_answer_closes_session_quietly(caplog):
+    """A dead browser ends the session: no error frame, no epoch-failed
+    traceback, and the engine request is torn down."""
+    engine = FakeEngineClient(["The", "cat", "sat"])
+    ws = DisconnectingWebSocket(fail_after_deltas=1)
+    handler = _persistent_handler(engine)
+    task = asyncio.create_task(handler.handle_session(ws))
+
+    ws.put(_config_msg())
+    await asyncio.sleep(0)
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg(10))})
+    await _settle(ws)
+    with caplog.at_level("INFO"):
+        ws.put({"type": "video.query", "text": "what is happening?"})
+        await asyncio.wait_for(task, timeout=5.0)
+
+    assert ws.dead
+    types = ws.sent_types()
+    assert "error" not in types  # a disconnect is not an error to report
+    assert "session.done" not in types  # the guarded send failed silently
+    assert engine.aborted  # result stream closed -> engine request released
+    assert engine.epochs == 1  # no retry loop
+    assert any("client disconnected" in r.getMessage() for r in caplog.records)
+    assert not any("epoch failed" in r.getMessage().lower() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_idle_timeout_mid_epoch_closes_session_cleanly(caplog):
+    """The reader's idle timeout takes the normal done path: one error frame
+    naming the timeout, then a clean close."""
+    engine = FakeEngineClient(["ok"])
+    ws = TimedWebSocket()
+    handler = QwenOmniStreamingVideoHandler(chat_service=object(), engine_client=engine, idle_timeout=0.2)
+    task = asyncio.create_task(handler.handle_session(ws))
+
+    ws.put(_config_msg())
+    await asyncio.sleep(0)
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg(10))})
+    await _settle(ws)
+    with caplog.at_level("WARNING"):
+        # No further client traffic: the reader's idle timeout fires mid-epoch.
+        await asyncio.wait_for(task, timeout=5.0)
+
+    assert {"type": "error", "message": "Idle timeout"} in ws.sent
+    assert "session.done" in ws.sent_types()
+    assert engine.epochs == 1
+    assert not any("epoch failed" in r.getMessage().lower() for r in caplog.records)
     assert not any("engine stream did not end" in r.getMessage() for r in caplog.records)

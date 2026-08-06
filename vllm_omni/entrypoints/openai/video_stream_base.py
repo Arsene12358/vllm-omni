@@ -153,10 +153,12 @@ class StreamingVideoSessionConfig(BaseModel):
         default=0,
         ge=0,
         le=64,
-        description="StreamingLLM-style sink: pin the first N retained frames "
-        "(the stream's opening) and re-inject them into every query so the "
-        "model can always reference the opening even after the buffer churns "
-        "past max_frames. 0 (default) = current windowed behavior.",
+        description="Persistent mode only: StreamingLLM-style sink — pin the "
+        "first N retained frames (the stream's opening) and re-seed them into "
+        "the new request at every position refresh, so the model can still "
+        "reference the opening after the buffer has churned past max_frames. "
+        "0 (default) = no pinned opening; opening recall is lost at the first "
+        "refresh. Ignored in windowed mode.",
     )
     persistent: bool = Field(
         default=False,

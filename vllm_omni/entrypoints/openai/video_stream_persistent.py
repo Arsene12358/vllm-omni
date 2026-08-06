@@ -165,6 +165,10 @@ def _text_output_state(output: OmniRequestOutput) -> tuple[str, Any, int] | None
     return (text, finish_reason, ntok)
 
 
+class _ClientGoneError(Exception):
+    """The browser went away while the driver was emitting an answer."""
+
+
 async def _emit_demux_event(websocket: WebSocket, ev: tuple) -> None:
     """Translate a demux event into a WebSocket response message."""
     kind = ev[0]
@@ -174,6 +178,23 @@ async def _emit_demux_event(websocket: WebSocket, ev: tuple) -> None:
         await websocket.send_json({"type": "response.text.delta", "delta": ev[1]})
     elif kind == "done":
         await websocket.send_json({"type": "response.text.done", "text": ev[1]})
+
+
+async def _close_result_stream(result_gen: Any) -> None:
+    """Tear down the engine request behind an epoch's result generator.
+
+    ``AsyncOmni.generate`` aborts its internal requests on ``GeneratorExit``,
+    so closing the generator is what releases the engine when the epoch ends
+    early (client disconnect, dropped terminal output). A drained generator is
+    already closed and this is a no-op.
+    """
+    aclose = getattr(result_gen, "aclose", None)
+    if aclose is None:
+        return
+    try:
+        await aclose()
+    except Exception:
+        logger.debug("persistent session: closing the result stream raised", exc_info=True)
 
 
 async def run_persistent_session(
@@ -422,7 +443,15 @@ async def run_persistent_session(
                 if ev[0] == "done":
                     expecting_answer["v"] = False
                     query_done_event.set()  # unblock ingestion (pacing)
-                await _emit_demux_event(websocket, ev)
+                try:
+                    await _emit_demux_event(websocket, ev)
+                except Exception as exc:
+                    # A failed send means the browser is gone. That ends the
+                    # session; it is not an epoch failure, so stop emitting and
+                    # unblock the input generator instead of unwinding loudly.
+                    done_event.set()
+                    query_done_event.set()
+                    raise _ClientGoneError from exc
 
     reader_task = asyncio.create_task(_reader())
     epoch = 0
@@ -431,6 +460,7 @@ async def run_persistent_session(
             demux = _TextStreamDemux()  # fresh per epoch (new request_id)
             request_id = f"vsess-{uuid.uuid4().hex[:8]}-{epoch}"
             inputs_done = asyncio.Event()
+            result_gen = None
             try:
                 result_gen = handler._engine_client.generate(
                     prompt=_tracked_epoch_input_stream(epoch, inputs_done),
@@ -450,6 +480,9 @@ async def run_persistent_session(
                         await asyncio.wait_for(consume_task, timeout=_PERSIST_STREAM_END_TIMEOUT)
                 finally:
                     inputs_task.cancel()
+            except _ClientGoneError:
+                logger.info("persistent session epoch %d: client disconnected; closing session", epoch)
+                break
             except asyncio.TimeoutError:
                 logger.warning(
                     "persistent session epoch %d: engine stream did not end within %.0fs of the "
@@ -462,8 +495,15 @@ async def run_persistent_session(
                 logger.exception("Persistent session epoch %d failed", epoch)
                 await handler._send_error(websocket, "Persistent session epoch failed")
                 break
+            finally:
+                # Whatever ended the epoch, release the engine request: a
+                # generator left suspended mid-stream would keep it alive.
+                await _close_result_stream(result_gen)
             epoch += 1
-        await websocket.send_json({"type": "session.done"})
+        try:
+            await websocket.send_json({"type": "session.done"})
+        except Exception:
+            logger.debug("persistent session: could not send session.done (socket closed)")
     finally:
         reader_task.cancel()
         try:
