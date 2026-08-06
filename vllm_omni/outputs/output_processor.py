@@ -470,6 +470,35 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             self.parent_requests[parent_req.request_id] = parent_req
         self.external_req_ids[req_state.external_req_id].append(request_id)
 
+    def _update_streaming_request_state(
+        self,
+        req_state: RequestState,
+        request: EngineCoreRequest,
+        prompt: str | None,
+    ) -> None:
+        """Close a pull-mode streaming session without dropping its terminal output.
+
+        Upstream ends a streaming-input session that the engine has already
+        drained (``input_chunk_queue is None``) by deleting the request state and
+        signalling ``STREAM_FINISHED`` on ``req_state.queue``. That works for
+        ``AsyncLLM``, which owns a per-request queue, but vllm-omni drives this
+        processor in *pull* mode: ``StagePool`` registers requests with
+        ``queue=None`` and reads outputs from ``process_outputs()``. The queue
+        signal is then a no-op and the early state deletion also makes the
+        engine's own terminal ``EngineCoreOutput`` unroutable (``process_outputs``
+        skips outputs whose state is gone), so no ``finished=True`` output ever
+        reaches the orchestrator and the client's stream never ends.
+
+        In pull mode, only mark the session closed. The terminal output the
+        scheduler emits for the finished session then finishes the request
+        through the normal ``process_outputs`` path, exactly as it does when the
+        session ends while an input chunk is still in flight.
+        """
+        if not request.resumable and req_state.queue is None and req_state.input_chunk_queue is None:
+            req_state.streaming_input = False
+            return
+        super()._update_streaming_request_state(req_state, request, prompt)
+
     def remove_request(self, request_id: str) -> None:
         """Rollback one previously registered request if it was never submitted."""
         req_state = self.request_states.pop(request_id, None)

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Regression tests for OmniRequestState multimodal DELTA drain and consolidation guard."""
 
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -10,7 +11,8 @@ import pytest
 import torch
 from vllm.outputs import PoolingRequestOutput
 from vllm.sampling_params import RequestOutputKind
-from vllm.v1.engine import EngineCoreEvent, EngineCoreEventType, FinishReason
+from vllm.v1.engine import EngineCoreEvent, EngineCoreEventType, EngineCoreOutput, FinishReason
+from vllm.v1.engine.output_processor import STREAM_FINISHED
 from vllm.v1.engine.output_processor import OutputProcessor as VLLMOutputProcessor
 from vllm.v1.metrics.stats import IterationStats, PrefillStats
 
@@ -663,3 +665,107 @@ def test_mm_only_outputs_update_iteration_stats():
     assert finished.finish_reason == FinishReason.STOP
     assert finished.num_prompt_tokens == state.prompt_len
     assert finished.num_generation_tokens == 2
+
+
+# ---------------------------------------------------------------------------
+# Streaming-session termination in pull mode (session-close hang regression)
+# ---------------------------------------------------------------------------
+#
+# StagePool registers requests with ``queue=None`` and reads outputs from
+# ``process_outputs()``. Upstream ends a drained streaming-input session by
+# deleting the request state and signalling only through ``req_state.queue``,
+# which strands the session forever in that mode: the engine's terminal output
+# is then discarded as "output for an already-aborted request".
+
+
+def _text_streaming_state() -> OmniRequestState:
+    """Text request state for a resumable session, registered as StagePool does."""
+    detok = MagicMock(
+        output_token_ids=[0],
+        get_next_output_text=MagicMock(return_value=""),
+        num_output_tokens=MagicMock(return_value=1),
+        update=MagicMock(return_value=None),
+    )
+    state = OmniRequestState(
+        **{**_DEFAULT_STATE_KWARGS, "detokenizer": detok},
+        output_kind=RequestOutputKind.CUMULATIVE,
+    )
+    state.is_prefilling = False
+    state.streaming_input = True
+    state.input_chunk_queue = deque()
+    return state
+
+
+def _pull_mode_processor(state: OmniRequestState) -> MultimodalOutputProcessor:
+    processor = MultimodalOutputProcessor(tokenizer=None, log_stats=False)
+    processor.request_states[state.request_id] = state
+    processor.external_req_ids[state.external_req_id].append(state.request_id)
+    return processor
+
+
+def _final_sentinel(request_id: str = "r"):
+    """The empty ``resumable=False`` request that closes a streaming session."""
+    return SimpleNamespace(request_id=request_id, resumable=False)
+
+
+def _chunk_stop(request_id: str = "r"):
+    return EngineCoreOutput(request_id, [7], finish_reason=FinishReason.LENGTH)
+
+
+def _session_terminal(request_id: str = "r"):
+    """What OmniARScheduler emits once the sentinel finishes the session."""
+    return EngineCoreOutput(request_id, [], finish_reason=FinishReason.ABORT)
+
+
+def test_close_after_drain_still_emits_terminal_output():
+    """Closing a session the engine already drained must still finish the request.
+
+    Reproduces the S2 session-close hang: a query on the last frame makes the
+    driver wait for the answer's finish before sending ``video.done``, so the
+    last chunk's stop is already processed (``input_chunk_queue is None``) when
+    the final sentinel arrives.
+    """
+    state = _text_streaming_state()
+    processor = _pull_mode_processor(state)
+
+    processor.process_outputs([_chunk_stop()])
+    assert state.input_chunk_queue is None  # engine drained
+
+    processor.add_request(_final_sentinel(), prompt=None)
+    assert "r" in processor.request_states  # state survives to route the terminal
+
+    result = processor.process_outputs([_session_terminal()])
+
+    assert len(result.request_outputs) == 1
+    assert result.request_outputs[0].finished is True
+    assert "r" not in processor.request_states
+
+
+def test_close_with_chunk_in_flight_still_finishes_on_that_chunk():
+    """Trailing frames keep a chunk in flight; its own stop must end the session."""
+    state = _text_streaming_state()
+    processor = _pull_mode_processor(state)
+
+    processor.add_request(_final_sentinel(), prompt=None)
+    assert state.streaming_input is False
+
+    result = processor.process_outputs([_chunk_stop()])
+
+    assert len(result.request_outputs) == 1
+    assert result.request_outputs[0].finished is True
+    assert "r" not in processor.request_states
+
+
+def test_close_after_drain_keeps_queue_mode_stream_finished_signal():
+    """AsyncLLM-style consumers (queue set) keep the upstream STREAM_FINISHED path."""
+    state = _text_streaming_state()
+    state.queue = MagicMock()
+    processor = _pull_mode_processor(state)
+
+    processor.process_outputs([_chunk_stop()])
+    assert state.input_chunk_queue is None
+
+    processor.add_request(_final_sentinel(), prompt=None)
+
+    assert state.queue.put.call_args.args[0] is STREAM_FINISHED
+    assert "r" not in processor.request_states
