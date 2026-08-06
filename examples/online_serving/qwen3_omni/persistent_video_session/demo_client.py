@@ -20,7 +20,7 @@ Usage:
 
 Requires: `websockets`, `pillow`, and a frame reader (`vllm.assets.video` if vLLM is
 installed, otherwise `opencv-python`). The server must already be serving (see the
-test guide / serve.sh).
+test guide / run_server.sh).
 """
 
 import argparse

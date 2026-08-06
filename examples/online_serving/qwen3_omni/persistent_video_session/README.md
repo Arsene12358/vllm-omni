@@ -118,6 +118,8 @@ memory stay flat, with the model's answers and refresh markers. Needs `ffmpeg` +
 | `system_prompt` (`--brief`) | session config | brevity instruction for clean two-sentence answers |
 | `persistent: false` | session config | the original windowed re-injection handler (unchanged) |
 
+One epoch accumulates about `refresh_at_position / 40` video items in a single request (40 is the driver's per-chunk M-RoPE position estimate), so keep `refresh_at_position / 40` at or below the server's `--limit-mm-per-prompt` video limit. The shipped pair is safe: `--refresh-at 2000` → ~50 items against `--limit-mm-per-prompt '{"video": 256}'`. Raise the server limit before raising `--refresh-at`.
+
 ## Troubleshooting
 
 - **Streaming session wedges mid-stream under `--enforce-eager`** — eager + the default

@@ -4,6 +4,8 @@
 prints timestamped OUT events (answers) so a side monitor's GPU-memory / KV-alive
 samples can be aligned into one timeline and rendered into a short video.
 
+The server must already be serving (see run_server.sh).
+
 Env: PORT, VIDEO_PATH, N_FRAMES, QUERY_EVERY, REFRESH_AT, SINK_FRAMES, NUM_FRAMES.
 """
 
