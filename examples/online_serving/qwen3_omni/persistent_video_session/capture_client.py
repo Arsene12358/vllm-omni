@@ -99,7 +99,10 @@ async def main() -> int:
         recv = asyncio.create_task(receiver())
         out("stream_start", frames=n)
         for i in range(n):
-            await ws.send(json.dumps({"type": "video.frame", "data": jpeg_b64(frames[i])}))
+            # Encode off the event loop: a synchronous encode per frame starves
+            # websocket keepalive pongs under flood (1011 close).
+            data = await asyncio.to_thread(jpeg_b64, frames[i])
+            await ws.send(json.dumps({"type": "video.frame", "data": data}))
             if (i + 1) % 25 == 0:
                 out("sent", n=i + 1)
             if (i + 1) % QUERY_EVERY == 0:
