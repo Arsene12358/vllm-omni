@@ -41,14 +41,19 @@ export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 # 49152 satisfies the single-rotation invariant for the shipped geometry —
 # rebase_at >= start + 2*recent: 2560 + 2*8192 = 18944 <= 49152 ✓ — and keeps
 # effective positions well under the 65536 trained-range wall.
-# ALSO raise --max-model-len: the request's token count binds ~15x before its
-# positions do (this workload measures ~0.056 positions/token), so at the default
-# 65536 the session is length-capped near position ~3,700 — before the first rebase
-# would ever fire. Size it to the intended session token horizon, e.g.
+# ALSO raise --max-model-len: the request's token count binds ~10.6x before its
+# positions do — measured on the demo clip at ~640px, one video item costs
+# ~23 positions / ~243 tokens, i.e. ~0.095 positions/token (per-item costs are
+# resolution-dependent; ~40 positions/item at ~1280px) — so at the default 65536
+# the session is length-capped near position ~6,200, before the first rebase would
+# ever fire. Size it to the intended session token horizon, e.g.
 # --max-model-len 1048576 (VLLM_ALLOW_LONG_MAX_MODEL_LEN is already exported above;
 # KV memory stays bounded by --streaming-kv-*, the extra cost is host-side buffers).
-# Scale --limit-mm-per-prompt the same way: ~1 video item per ~40 positions
-# (~714 tokens), so a 1M-token session needs e.g. '{"video": 2048}'.
+# AND raise --limit-mm-per-prompt: reaching the first rebase alone takes
+# 49152/23 ~= 2150 video items (set it >= ~2200), a 1M-token horizon holds
+# 1048576/243 ~= 4300 (rule of thumb: max-model-len/240, e.g. '{"video": 5120}')
+# — and at ~2 frames/item, ANY rebase-mode run past ~500 frames needs a raise
+# from the shipped '{"video": 256}'.
 vllm serve "$MODEL" --omni --port "$PORT" \
   --trust-remote-code --max-num-seqs 1 \
   --max-model-len 65536 \

@@ -116,18 +116,20 @@ KV **memory** is always bounded by the streaming-KV eviction (`--streaming-kv-*`
 Enable it on **both** sides (the server flag alone never triggers — the driver still refreshes first; the client flag alone removes the only position bound):
 
 ```bash
-# server — add to the serve command (run_server.sh ships this as a commented block,
-# with the required --max-model-len raise explained there and below):
+# server — add to the serve command (run_server.sh ships this as a commented block;
+# the required --max-model-len and --limit-mm-per-prompt raises are explained
+# there and below):
 #   --streaming-kv-rebase-at 49152 \
 # client:
 python demo_client.py --video your_clip.mp4 --port 8901 \
     --frames 800 --query-every 50 --engine-rebase --sink 6 --recent 10
+# (this example run stays below the rebase threshold — stream longer to see rebases)
 # capture_client.py: prefix with ENGINE_REBASE=1
 ```
 
 **The invariant** (validated at server startup): `rebase_at >= start_size + 2*recent_size`, which keeps consecutive rebases at least one full recent window apart so any cached KV entry is rotated at most once before eviction claims it. The shipped geometry passes with room — `2560 + 2*8192 = 18944 <= 49152` ✓ — and effective positions stay well under the 65536 trained-range wall.
 
-**Raise `--max-model-len` with it.** The request's token count binds ~15× before its positions do (this workload measures ~0.056 positions per token), so at the default `--max-model-len 65536` the session is length-capped near position ~3,700 and the first rebase would never fire. Size it to the intended session token horizon, e.g. `--max-model-len 1048576` (`VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` is already exported by `run_server.sh`; KV memory stays bounded by `--streaming-kv-*`, the added cost is host-side buffers). Scale `--limit-mm-per-prompt` the same way: ~1 video item per ~40 positions ≈ ~714 tokens, so a 1M-token session needs e.g. `'{"video": 2048}'`.
+**Raise `--max-model-len` and `--limit-mm-per-prompt` with it.** The request's token count binds ~10.6× before its positions do — measured on the demo clip at ~640px, one video item costs ~23 positions / ~243 tokens, i.e. ~0.095 positions per token (per-item costs are resolution-dependent: ~40 positions/item at ~1280px, which is also the driver's deliberately conservative refresh estimate) — so at the default `--max-model-len 65536` the session is length-capped near position ~6,200 and the first rebase would never fire. Size it to the intended session token horizon, e.g. `--max-model-len 1048576` (`VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` is already exported by `run_server.sh`; KV memory stays bounded by `--streaming-kv-*`, the added cost is host-side buffers). The video-item limit binds even sooner: reaching the first rebase alone takes `49152/23 ≈ 2150` items (set the limit ≥ ~2200), a 1M-token horizon holds `1048576/243 ≈ 4300` (rule of thumb: `max-model-len/240`, e.g. `'{"video": 5120}'`) — and at ~2 frames per item, **any** rebase-mode run past ~500 frames needs a raise from the shipped `'{"video": 256}'` (refresh mode never hits it: each epoch re-seeds after ~50 items).
 
 **Observability.** Each rebase logs one line in this fixed format (grep-stable, like the eviction line):
 
