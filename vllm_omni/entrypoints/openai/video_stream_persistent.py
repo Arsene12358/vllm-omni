@@ -5,7 +5,9 @@
 Drives ONE long-lived engine streaming request per epoch that ingests frames
 as input-only chunks (KV retained across queries, no per-query re-prefill) and
 refreshes at the M-RoPE position boundary by re-seeding [sink + recent] into a
-new request. Complements the windowed re-injection handler in
+new request. With ``engine_rebase`` the engine's streaming-KV rebase keeps
+positions bounded instead, so the session is a single epoch-0 request forever
+(no driver-side refresh). Complements the windowed re-injection handler in
 :mod:`vllm_omni.entrypoints.openai.video_stream_base`, which routes here from
 ``handle_session`` when the session config sets ``persistent``.
 """
@@ -212,6 +214,11 @@ async def run_persistent_session(
     wall 65536), the epoch ends and a fresh request re-seeds
     [opening + recent] -> position resets to 0, opening recall preserved.
     Validated mechanic: jobs 2051/2069.
+
+    With ``config.engine_rebase`` the engine's ``--streaming-kv-rebase-at``
+    keeps M-RoPE positions bounded, so the driver never refreshes: no
+    position accounting, no re-seed, ONE epoch-0 engine request for the
+    session's lifetime (the input generator returns only on ``done_event``).
     """
     if handler._engine_client is None:
         await handler._send_error(websocket, "Streaming video requires an engine client")
@@ -224,6 +231,13 @@ async def run_persistent_session(
     seed_prefix = _qwen_seed_prefix(sys_prompt)
     opening_size = config.sink_frames  # frames pinned as the re-seeded opening
     recent_window = config.num_frames  # frames carried into the re-seed for continuity
+    engine_rebase = config.engine_rebase  # engine keeps positions bounded -> never refresh
+    if engine_rebase and "refresh_at_position" in config.model_fields_set:
+        logger.warning(
+            "engine_rebase mode: refresh_at_position=%d is ignored (the engine's "
+            "streaming-KV rebase keeps positions bounded; no driver-side refresh)",
+            config.refresh_at_position,
+        )
     if opening_size == 0:
         logger.warning("persistent mode with sink_frames=0: opening recall not preserved across refresh")
 
@@ -348,11 +362,18 @@ async def run_persistent_session(
     )
 
     def _ingest_frames(frames: list) -> None:
+        # The opening/recent buffers stay maintained in engine_rebase mode too,
+        # even though only the refresh re-seed consumes them today: they are
+        # bounded (sink_frames / num_frames caps) and keeping ingestion
+        # mode-uniform preserves the session state any future teardown or
+        # recovery path would need. Position accounting, by contrast, feeds
+        # only the refresh check, so engine_rebase skips its bookkeeping.
         for f in frames:
             if len(opening) < opening_size:
                 opening.append(f)
             recent.append(f)
-        pos_est["v"] += _est(len(frames))
+        if not engine_rebase:
+            pos_est["v"] += _est(len(frames))
 
     def _epoch_input_stream(epoch: int):
         async def gen():
@@ -390,7 +411,7 @@ async def run_persistent_session(
             # refresh loop.
             progressed = False
             while True:
-                if progressed and pos_est["v"] >= config.refresh_at_position:
+                if not engine_rebase and progressed and pos_est["v"] >= config.refresh_at_position:
                     return  # end epoch at a frame boundary -> triggers refresh
                 ev = await _next_chunk()
                 if ev[0] == "done":
@@ -499,6 +520,12 @@ async def run_persistent_session(
                 # Whatever ended the epoch, release the engine request: a
                 # generator left suspended mid-stream would keep it alive.
                 await _close_result_stream(result_gen)
+            if engine_rebase:
+                # ONE engine request per session: the input generator only
+                # returns on done_event, so reaching here without it (an
+                # engine-side stream end) closes the session instead of
+                # re-seeding a second request the mode promises never to make.
+                break
             epoch += 1
         try:
             await websocket.send_json({"type": "session.done"})

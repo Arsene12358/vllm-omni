@@ -177,6 +177,14 @@ class StreamingVideoSessionConfig(BaseModel):
         "to refresh (re-seed). Kept below the trained-range wall (65536). The "
         "handler estimates position from ingested chunks (~spatial-tax/chunk).",
     )
+    engine_rebase: bool = Field(
+        default=False,
+        description="Persistent mode only: the engine's --streaming-kv-rebase-at "
+        "keeps M-RoPE positions bounded, so the driver runs a single engine "
+        "request forever — no epochs, no re-seed. refresh_at_position is "
+        "ignored (warned) when set. False (default) = driver-side refresh "
+        "(the shipped fallback).",
+    )
 
 
 class OmniStreamingVideoHandler:

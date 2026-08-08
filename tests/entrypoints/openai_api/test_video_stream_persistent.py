@@ -171,6 +171,13 @@ def test_persistent_config_field_bounds():
         StreamingVideoSessionConfig(model="test", sink_frames=65)
 
 
+def test_engine_rebase_config_defaults_and_validation():
+    assert StreamingVideoSessionConfig(model="test").engine_rebase is False
+    assert StreamingVideoSessionConfig(model="test", engine_rebase=True).engine_rebase is True
+    with pytest.raises(ValidationError):
+        StreamingVideoSessionConfig(model="test", engine_rebase="not-a-bool")
+
+
 # ---------------------------------------------------------------------------
 # run_persistent_session driver
 # ---------------------------------------------------------------------------
@@ -648,6 +655,91 @@ async def test_reseed_alone_does_not_spin_zero_progress_refresh_loop(monkeypatch
     await asyncio.wait_for(task, timeout=5.0)
 
     assert engine.epochs == 2
+    assert "session.done" in ws.sent_types()
+
+
+@pytest.mark.asyncio
+async def test_engine_rebase_single_request_survives_refresh_volume(monkeypatch):
+    # A frame volume that would force refreshes in fallback mode: 4 chunks at
+    # 30000 estimated positions each crosses the default refresh_at_position
+    # (60000) twice over. With engine_rebase the engine keeps positions
+    # bounded, so the whole session must stay one epoch-0 engine request.
+    monkeypatch.setattr(video_stream_persistent, "_PERSIST_EST_POS_PER_CHUNK", 30000)
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        video_stream_persistent.logger,
+        "warning",
+        lambda message, *args, **_kwargs: warnings.append(message % args if args else message),
+    )
+    ingest_start = asyncio.Event()
+    engine = FakeEngineClient(["ok"], ingest_start=ingest_start)
+    ws = TimedWebSocket()
+    handler = _persistent_handler(engine)
+    task = asyncio.create_task(handler.handle_session(ws))
+
+    msg = _config_msg(engine_rebase=True)
+    del msg["refresh_at_position"]  # left unset -> no "ignored" warning expected
+    ws.put(msg)
+    await asyncio.sleep(0)
+    for shade in (10, 40, 70, 100, 130, 160, 190, 220):
+        ws.put({"type": "video.frame", "data": _b64(_make_jpeg(shade))})
+    ws.put({"type": "video.done"})
+    await _settle(ws)
+    ingest_start.set()
+
+    await asyncio.wait_for(task, timeout=5.0)
+
+    # ONE engine request for the session lifetime, epoch pinned to 0.
+    assert engine.epochs == 1
+    assert len(engine.calls) == 1
+    assert re.fullmatch(r"vsess-[0-9a-f]{8}-0", engine.calls[0]["request_id"])
+
+    # Zero re-seed chunks: exactly one seed-prefix chunk (the epoch-0 seed);
+    # every later chunk is a bare video block extending the same request.
+    shapes = [(c["text"], c["n_frames"], c["max_tokens"]) for c in engine.chunks]
+    assert shapes == [
+        (_SEED_PREFIX + _VID_BLOCK, 2, 1),
+        (_VID_BLOCK, 2, 1),
+        (_VID_BLOCK, 2, 1),
+        (_VID_BLOCK, 2, 1),
+    ]
+    assert sum(c["text"].startswith(_SEED_PREFIX) for c in engine.chunks) == 1
+    assert "session.done" in ws.sent_types()
+    assert not any("refresh_at_position" in w for w in warnings)
+
+
+@pytest.mark.asyncio
+async def test_engine_rebase_warns_once_and_ignores_refresh_at_position(monkeypatch):
+    # refresh_at_position explicitly set alongside engine_rebase: one warning,
+    # value ignored — the estimated position crosses it and nothing refreshes.
+    monkeypatch.setattr(video_stream_persistent, "_PERSIST_EST_POS_PER_CHUNK", 20000)
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        video_stream_persistent.logger,
+        "warning",
+        lambda message, *args, **_kwargs: warnings.append(message % args if args else message),
+    )
+    ingest_start = asyncio.Event()
+    engine = FakeEngineClient(["ok"], ingest_start=ingest_start)
+    ws = TimedWebSocket()
+    handler = _persistent_handler(engine)
+    task = asyncio.create_task(handler.handle_session(ws))
+
+    ws.put(_config_msg(engine_rebase=True, refresh_at_position=30000))
+    await asyncio.sleep(0)
+    for shade in (10, 40, 70, 100):
+        ws.put({"type": "video.frame", "data": _b64(_make_jpeg(shade))})
+    ws.put({"type": "video.done"})
+    await _settle(ws)
+    ingest_start.set()
+
+    await asyncio.wait_for(task, timeout=5.0)
+
+    ignored = [w for w in warnings if "refresh_at_position" in w]
+    assert len(ignored) == 1
+    assert "30000" in ignored[0] and "ignored" in ignored[0]
+    assert engine.epochs == 1  # no refresh despite crossing the configured position
+    assert re.fullmatch(r"vsess-[0-9a-f]{8}-0", engine.calls[0]["request_id"])
     assert "session.done" in ws.sent_types()
 
 
