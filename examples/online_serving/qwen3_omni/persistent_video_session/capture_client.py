@@ -6,7 +6,9 @@ samples can be aligned into one timeline and rendered into a short video.
 
 The server must already be serving (see run_server.sh).
 
-Env: PORT, VIDEO_PATH, N_FRAMES, QUERY_EVERY, REFRESH_AT, SINK_FRAMES, NUM_FRAMES.
+Env: PORT, VIDEO_PATH, N_FRAMES, QUERY_EVERY, REFRESH_AT, SINK_FRAMES, NUM_FRAMES,
+ENGINE_REBASE (=1: engine-side position rebase — one request forever, REFRESH_AT
+not sent; the server needs --streaming-kv-rebase-at, see README).
 """
 
 import asyncio
@@ -29,6 +31,7 @@ QUERY_EVERY = int(os.environ.get("QUERY_EVERY", "80"))
 REFRESH_AT = int(os.environ.get("REFRESH_AT", "2000"))
 SINK = int(os.environ.get("SINK_FRAMES", "6"))
 RECENT = int(os.environ.get("NUM_FRAMES", "10"))
+ENGINE_REBASE = os.environ.get("ENGINE_REBASE", "0").lower() in ("1", "true")
 QUERY = "In one sentence each: (a) what is happening right now, and (b) what was shown at the very beginning?"
 BRIEF = (
     "You are a video understanding assistant. Answer in exactly two short sentences: "
@@ -56,24 +59,32 @@ async def main() -> int:
     n = int(frames.shape[0])
     model = model_id()
     uri = f"ws://localhost:{PORT}/v1/video/chat/stream"
-    out("config", frames=n, query_every=QUERY_EVERY, refresh_at=REFRESH_AT)
+    out(
+        "config",
+        frames=n,
+        query_every=QUERY_EVERY,
+        refresh_at=("-" if ENGINE_REBASE else REFRESH_AT),
+        engine_rebase=int(ENGINE_REBASE),
+    )
 
     async with websockets.connect(uri, max_size=64 * 1024 * 1024) as ws:
-        await ws.send(
-            json.dumps(
-                {
-                    "type": "session.config",
-                    "model": model,
-                    "modalities": ["text"],
-                    "persistent": True,
-                    "sink_frames": SINK,
-                    "num_frames": RECENT,
-                    "refresh_at_position": REFRESH_AT,
-                    "enable_frame_filter": False,
-                    "system_prompt": BRIEF,
-                }
-            )
-        )
+        config = {
+            "type": "session.config",
+            "model": model,
+            "modalities": ["text"],
+            "persistent": True,
+            "sink_frames": SINK,
+            "num_frames": RECENT,
+            "enable_frame_filter": False,
+            "system_prompt": BRIEF,
+        }
+        if ENGINE_REBASE:
+            # Engine-side rebase bounds positions; one request runs forever.
+            # Don't send refresh_at_position — the driver warns and ignores it.
+            config["engine_rebase"] = True
+        else:
+            config["refresh_at_position"] = REFRESH_AT
+        await ws.send(json.dumps(config))
 
         done = asyncio.Event()
 

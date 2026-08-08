@@ -89,8 +89,9 @@ async def main(a) -> int:
     model = model_id(a.port)
     uri = f"ws://{a.host}:{a.port}/v1/video/chat/stream"
     n_q = sum(1 for i in range(1, n + 1) if i % a.query_every == 0)
+    mode = "engine_rebase" if a.engine_rebase else f"refresh_at={a.refresh_at}"
     print(
-        f"[demo] model={model} frames={n} queries~={n_q} refresh_at={a.refresh_at} sink={a.sink} recent={a.recent}",
+        f"[demo] model={model} frames={n} queries~={n_q} {mode} sink={a.sink} recent={a.recent}",
         flush=True,
     )
 
@@ -104,9 +105,15 @@ async def main(a) -> int:
             "persistent": True,
             "sink_frames": a.sink,
             "num_frames": a.recent,
-            "refresh_at_position": a.refresh_at,
             "enable_frame_filter": False,
         }
+        if a.engine_rebase:
+            # Engine-side rebase bounds positions; the driver runs ONE request
+            # forever. Don't send refresh_at_position — the driver would warn
+            # and ignore it.
+            config["engine_rebase"] = True
+        else:
+            config["refresh_at_position"] = a.refresh_at
         if a.brief:
             config["system_prompt"] = (
                 "You are a video understanding assistant. Answer in exactly two short "
@@ -160,11 +167,19 @@ async def main(a) -> int:
     print(f"answers={len(answers)}  errors={len(errors)}  session_done={got_done}", flush=True)
     ok = got_done and not errors and len(answers) >= 1 and all(x for x in answers)
     print(f"checks: clean close={got_done}  no errors={not errors}  all answered={ok}", flush=True)
-    print(
-        "Now confirm in the SERVER log: `[streaming-kv] eviction ... alive=N` stays flat and "
-        "new `vsess-...-<epoch>` ids appear (one per refresh).",
-        flush=True,
-    )
+    if a.engine_rebase:
+        print(
+            "Now confirm in the SERVER log: `[streaming-kv] eviction ... alive=N` stays flat, the request id "
+            "stays `vsess-...-0` (no refresh re-seeds), and — once the stream crosses --streaming-kv-rebase-at — "
+            "`[streaming-kv] rebase req=... delta=... new_base=... recent_tokens=...` lines appear.",
+            flush=True,
+        )
+    else:
+        print(
+            "Now confirm in the SERVER log: `[streaming-kv] eviction ... alive=N` stays flat and "
+            "new `vsess-...-<epoch>` ids appear (one per refresh).",
+            flush=True,
+        )
     print(f"RESULT: {'PASS' if ok else 'CHECK LOG'}", flush=True)
     return 0 if ok else 1
 
@@ -177,6 +192,12 @@ if __name__ == "__main__":
     p.add_argument("--frames", type=int, default=800, help="frames to stream (crosses refreshes)")
     p.add_argument("--query-every", type=int, default=50, help="frames between questions")
     p.add_argument("--refresh-at", type=int, default=2000, help="M-RoPE position estimate to refresh at (>=1024)")
+    p.add_argument(
+        "--engine-rebase",
+        action="store_true",
+        help="trust the engine's --streaming-kv-rebase-at to bound positions: one request forever, "
+        "no driver refreshes (--refresh-at is not sent)",
+    )
     p.add_argument("--sink", type=int, default=6, help="opening frames pinned + re-seeded each epoch")
     p.add_argument("--recent", type=int, default=10, help="recent frames re-seeded for continuity")
     p.add_argument("--brief", action="store_true", help="send a brevity system prompt (cleaner answers)")

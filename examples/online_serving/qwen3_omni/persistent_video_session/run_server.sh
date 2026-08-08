@@ -29,6 +29,26 @@ export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 # a deploy config (--deploy-config <yaml>) — the --no-async-scheduling CLI flag is
 # NOT sufficient (it flips the engine arg but leaves the async scheduler class
 # resolved from the deploy YAML). See README "Troubleshooting".
+#
+# OPTIONAL — engine-rebase mode (unbounded session; the default launch below stays
+# refresh mode). With the flag below the ENGINE keeps M-RoPE positions bounded by
+# rebasing them in place, so one request runs for the whole session; enable it by
+# adding the flag to the command below AND passing --engine-rebase to the client
+# (see README "Two boundedness modes"):
+#
+#   --streaming-kv-rebase-at 49152 \
+#
+# 49152 satisfies the single-rotation invariant for the shipped geometry —
+# rebase_at >= start + 2*recent: 2560 + 2*8192 = 18944 <= 49152 ✓ — and keeps
+# effective positions well under the 65536 trained-range wall.
+# ALSO raise --max-model-len: the request's token count binds ~15x before its
+# positions do (this workload measures ~0.056 positions/token), so at the default
+# 65536 the session is length-capped near position ~3,700 — before the first rebase
+# would ever fire. Size it to the intended session token horizon, e.g.
+# --max-model-len 1048576 (VLLM_ALLOW_LONG_MAX_MODEL_LEN is already exported above;
+# KV memory stays bounded by --streaming-kv-*, the extra cost is host-side buffers).
+# Scale --limit-mm-per-prompt the same way: ~1 video item per ~40 positions
+# (~714 tokens), so a 1M-token session needs e.g. '{"video": 2048}'.
 vllm serve "$MODEL" --omni --port "$PORT" \
   --trust-remote-code --max-num-seqs 1 \
   --max-model-len 65536 \

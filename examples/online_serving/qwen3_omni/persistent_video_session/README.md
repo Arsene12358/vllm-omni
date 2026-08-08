@@ -13,7 +13,7 @@ This is the `persistent` mode of the `/v1/video/chat/stream` WebSocket handler
 `persistent: true` in the session config drives one engine streaming request that
 ingests frames as input-only chunks (KV held flat by streaming-KV eviction, no
 per-query re-prefill) and refreshes at the rotary-position boundary by re-seeding
-`[opening + recent]`.
+`[opening + recent]`. That driver-side refresh is the default of two position-boundedness modes — with a rebase-capable engine the refresh disappears entirely and one request runs forever (see "Two boundedness modes" below).
 
 Open `assets/showcase.html` for a narrated walkthrough with an embedded ~45 s
 recording of a live session (the recording is being re-captured on the v0.26.0
@@ -106,6 +106,42 @@ VIDEO_PATH=your_clip.mp4 python capture_client.py >> capture.log   # stream + br
 `render_demo.py` draws tokens-processed climbing while the live KV working set and GPU
 memory stay flat, with the model's answers and refresh markers. Needs `ffmpeg` + `pillow`.
 
+## Two boundedness modes
+
+KV **memory** is always bounded by the streaming-KV eviction (`--streaming-kv-*`). M-RoPE **positions** are what would otherwise grow with the stream — past the model's trained range (65536) quality collapses — and the session bounds them in one of two ways:
+
+- **Refresh (default — the validated fallback).** The driver estimates positions and, at `refresh_at_position`, ends the engine request and re-seeds a fresh one from `[opening + recent]`. Positions restart every epoch; request ids step `vsess-...-0, -1, -2, ...`. Everything under "Run the demo" uses this mode.
+- **Engine rebase (`engine_rebase: true` — unbounded, one request forever).** The engine itself rebases positions in place when they cross `--streaming-kv-rebase-at` (rotating the recent KV window to match), so the driver never refreshes: a single engine request serves the whole session — no epochs, no re-seeding, and the request id stays `vsess-...-0`. If `refresh_at_position` is also set, the driver warns once and ignores it.
+
+Enable it on **both** sides (the server flag alone never triggers — the driver still refreshes first; the client flag alone removes the only position bound):
+
+```bash
+# server — add to the serve command (run_server.sh ships this as a commented block,
+# with the required --max-model-len raise explained there and below):
+#   --streaming-kv-rebase-at 49152 \
+# client:
+python demo_client.py --video your_clip.mp4 --port 8901 \
+    --frames 800 --query-every 50 --engine-rebase --sink 6 --recent 10
+# capture_client.py: prefix with ENGINE_REBASE=1
+```
+
+**The invariant** (validated at server startup): `rebase_at >= start_size + 2*recent_size`, which keeps consecutive rebases at least one full recent window apart so any cached KV entry is rotated at most once before eviction claims it. The shipped geometry passes with room — `2560 + 2*8192 = 18944 <= 49152` ✓ — and effective positions stay well under the 65536 trained-range wall.
+
+**Raise `--max-model-len` with it.** The request's token count binds ~15× before its positions do (this workload measures ~0.056 positions per token), so at the default `--max-model-len 65536` the session is length-capped near position ~3,700 and the first rebase would never fire. Size it to the intended session token horizon, e.g. `--max-model-len 1048576` (`VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` is already exported by `run_server.sh`; KV memory stays bounded by `--streaming-kv-*`, the added cost is host-side buffers). Scale `--limit-mm-per-prompt` the same way: ~1 video item per ~40 positions ≈ ~714 tokens, so a 1M-token session needs e.g. `'{"video": 2048}'`.
+
+**Observability.** Each rebase logs one line in this fixed format (grep-stable, like the eviction line):
+
+```
+[streaming-kv] rebase req=<id> delta=<int> new_base=<int> recent_tokens=<int>
+```
+
+```bash
+grep "streaming-kv. rebase" server.log                    # one line per rebase, once positions cross 49152
+grep -oE "vsess-[a-f0-9]+-[0-9]+" server.log | sort -u    # stays vsess-...-0: no refresh re-seeds
+```
+
+Engine-rebase mode needs the rebase overlay branches: [`Arsene12358/vllm@feat/streaming-kv-rebase-v026`](https://github.com/Arsene12358/vllm/tree/feat/streaming-kv-rebase-v026) (a superset of `feat/streaming-kv-v026`; same pure-Python overlay recipe as in "Requirements", substituting the branch name) and this vLLM-Omni branch (`feat/persistent-rebase-v026`). Refresh mode runs on the base branches unchanged.
+
 ## Config / tuning knobs
 
 | Knob | Where | Effect |
@@ -113,7 +149,9 @@ memory stay flat, with the model's answers and refresh markers. Needs `ffmpeg` +
 | `sink_frames` (`--sink`) | session config | opening frames pinned + re-seeded each epoch (the retained opening) |
 | `num_frames` (`--recent`) | session config | recent frames re-seeded at a refresh for continuity |
 | `refresh_at_position` (`--refresh-at`, ≥1024) | session config | larger → longer epochs / fewer refreshes (keep epoch tokens < `max-model-len`) |
+| `engine_rebase: true` (`--engine-rebase` / `ENGINE_REBASE=1`) | session config | trust the engine's position rebase: one request forever, no driver refreshes; `refresh_at_position` ignored (see "Two boundedness modes") |
 | `--streaming-kv-start-size` / `-recent-size` | server | KV tokens pinned (opening) / kept (recent) — the memory bound |
+| `--streaming-kv-rebase-at` | server | engine-side position-rebase threshold (`engine_rebase` mode); must be ≥ `start + 2*recent` |
 | `--max-num-seqs` | server | concurrent persistent sessions per server; the demo default `1` keeps single-viewer latency, `8` validated with 8 concurrent streams on 2×H200 (each stream keeps its own flat 672–673 KV band) |
 | `system_prompt` (`--brief`) | session config | brevity instruction for clean two-sentence answers |
 | `persistent: false` | session config | the original windowed re-injection handler (unchanged) |
