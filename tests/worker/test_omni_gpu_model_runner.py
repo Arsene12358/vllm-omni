@@ -1,9 +1,13 @@
+import importlib
+import sys
 from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
+import vllm_omni.worker.gpu_model_runner as gpu_model_runner_module
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner, _filter_mrope_kwargs_for_model
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
@@ -664,3 +668,121 @@ def test_maybe_attach_mimo_audio_req_infos_no_req_state_returns_input():
 
     # When no req_state, helper should be a no-op.
     assert result is req_infos
+
+
+# ---------------------------------------------------------------------------
+# Preemption-resume streaming-KV rebase-offset clearing (mirror of upstream
+# GPUModelRunner._update_states on the feat/streaming-kv-rebase vLLM overlay)
+# ---------------------------------------------------------------------------
+
+
+def _make_rebased_req_state(offset: int) -> tuple[CachedRequestState, torch.Tensor]:
+    """A request state carrying a streaming-KV rebase offset, i.e. whose stored
+    M-RoPE positions are ``raw - offset``. Returns the state and the raw positions."""
+    raw_positions = torch.arange(3 * 6, dtype=torch.int64).view(3, 6) + 240
+    req_state = CachedRequestState(
+        req_id="vsess-0",
+        prompt_token_ids=[1, 2, 3, 4],
+        mm_features=[],
+        sampling_params=None,
+        generator=None,
+        block_ids=([1, 2],),
+        num_computed_tokens=96,
+        output_token_ids=[5, 6],
+    )
+    req_state.mrope_positions = raw_positions - offset
+    req_state.mrope_position_delta = -42 - offset
+    req_state.mrope_rebase_offset = offset
+    return req_state, raw_positions
+
+
+def _make_resumed_request_runner(monkeypatch, req_state):
+    """A minimal runner + scheduler output that drives one preemption-resumed
+    request through the real ``_update_states`` (no spec decode, last PP rank)."""
+    monkeypatch.setattr(gpu_model_runner_module, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True))
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.requests = {req_state.req_id: req_state}
+    runner.model_intermediate_buffer = {}
+    runner.num_prompt_logprobs = {}
+    runner.encoder_cache = {}
+    runner.omni_prefix_cache = None
+    runner.speculative_config = None
+    runner.use_async_scheduling = False
+    runner.use_async_spec_decode = False
+    runner.late_interaction_runner = SimpleNamespace(on_requests_finished=lambda req_ids: None)
+    added = []
+    runner.input_batch = SimpleNamespace(
+        req_id_to_index={},
+        remove_request=lambda req_id: None,
+        add_request=added.append,
+        added=added,
+        update_req_spec_token_ids=lambda state, spec_tokens: None,
+        condense=lambda: None,
+        refresh_metadata=lambda: None,
+    )
+    runner._may_reorder_batch = lambda scheduler_output: None
+    scheduler_output = SimpleNamespace(
+        finished_req_ids=set(),
+        new_block_ids_to_zero=[],
+        free_encoder_mm_hashes=[],
+        num_scheduled_tokens={req_state.req_id: 1},
+        scheduled_new_reqs=[],
+        scheduled_spec_decode_tokens={},
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=[req_state.req_id],
+            resumed_req_ids={req_state.req_id},
+            num_computed_tokens=[0],
+            new_block_ids=[([7, 8],)],
+            num_output_tokens=[len(req_state.output_token_ids)],
+            new_token_ids=[],
+        ),
+    )
+    return runner, scheduler_output
+
+
+def test_resumed_from_preemption_clears_the_streaming_rebase_offset(monkeypatch):
+    # Preemption freed the rotated K the offset described, so the resumed
+    # branch must un-shift positions/delta back to raw and zero the offset.
+    req_state, raw_positions = _make_rebased_req_state(offset=208)
+    runner, scheduler_output = _make_resumed_request_runner(monkeypatch, req_state)
+
+    assert runner._update_states(scheduler_output) is None
+
+    assert req_state.mrope_rebase_offset == 0
+    assert torch.equal(req_state.mrope_positions, raw_positions)
+    assert req_state.mrope_position_delta == -42
+    # The rest of the resumed branch behaved as before the mirror.
+    assert req_state.block_ids == ([7, 8],)
+    assert req_state.num_computed_tokens == 0
+    assert runner.input_batch.added == [req_state]
+
+
+def test_resumed_from_preemption_without_the_rebase_overlay_is_a_noop(monkeypatch):
+    # On a stock vLLM (the refresh fallback deployment) the guarded import
+    # binds clear_rebase_offset to None; the branch must not touch the state.
+    monkeypatch.setattr(gpu_model_runner_module, "clear_rebase_offset", None)
+    req_state, raw_positions = _make_rebased_req_state(offset=208)
+    runner, scheduler_output = _make_resumed_request_runner(monkeypatch, req_state)
+
+    assert runner._update_states(scheduler_output) is None
+
+    assert req_state.mrope_rebase_offset == 208
+    assert torch.equal(req_state.mrope_positions, raw_positions - 208)
+    assert req_state.mrope_position_delta == -42 - 208
+    assert req_state.block_ids == ([7, 8],)
+    assert runner.input_batch.added == [req_state]
+
+
+def test_runner_module_imports_against_a_stock_vllm_without_the_rebase_overlay(monkeypatch):
+    # The venv's vLLM carries the overlay, so the guarded import resolved.
+    assert gpu_model_runner_module.clear_rebase_offset is not None
+    # A None entry in sys.modules makes the import raise ImportError — exactly
+    # what a stock vLLM without vllm.v1.attention.streaming_rebase does.
+    monkeypatch.setitem(sys.modules, "vllm.v1.attention.streaming_rebase", None)
+    try:
+        reloaded = importlib.reload(gpu_model_runner_module)
+        assert reloaded.clear_rebase_offset is None
+    finally:
+        monkeypatch.undo()
+        importlib.reload(gpu_model_runner_module)
+    assert gpu_model_runner_module.clear_rebase_offset is not None

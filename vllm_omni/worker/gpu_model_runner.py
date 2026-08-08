@@ -36,6 +36,14 @@ from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEm
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 
+try:
+    # Only vLLM builds carrying the streaming-KV rebase overlay
+    # (feat/streaming-kv-rebase-v026) ship this module. The refresh fallback
+    # deployment runs a stock vLLM, so feature-detect instead of requiring it.
+    from vllm.v1.attention.streaming_rebase import clear_rebase_offset
+except ImportError:  # stock vLLM: no rebase feature, no offset to clear
+    clear_rebase_offset = None
+
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.outputs import RoutedExpertsLists
@@ -736,6 +744,14 @@ class OmniGPUModelRunner(GPUModelRunner):
                 # The request is resumed from preemption.
                 # Replace the existing block IDs with the new ones.
                 req_state.block_ids = new_block_ids
+                # Mirrors upstream GPUModelRunner._update_states: preemption
+                # freed every block and reset num_computed_tokens to 0, so the
+                # rotated K a streaming-KV rebase offset describes is gone and
+                # the re-prefill starts from token 0. Drop the offset with the
+                # KV it described, or that re-prefill would read the stored
+                # positions at `raw - offset`, i.e. negative.
+                if clear_rebase_offset is not None:
+                    clear_rebase_offset(req_state)
 
             req_index = self.input_batch.req_id_to_index.get(req_id)
             if req_index is None:
