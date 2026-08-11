@@ -28,6 +28,8 @@ from vllm_omni.entrypoints.openai.video_stream_base import (
     StreamingVideoSessionConfig,
 )
 from vllm_omni.entrypoints.openai.video_stream_persistent import (
+    _PERSIST_QUERY_REPETITION_DETECTION,
+    _PERSIST_QUERY_REPETITION_PENALTY,
     _VID_BLOCK,
     _TextStreamDemux,
 )
@@ -146,6 +148,50 @@ def test_demux_empty_throwaways_and_reemits_between_queries():
         ("delta", " done"),
         ("done", "(a) Y done"),
     ]
+
+
+def test_demux_segments_request_cumulative_answers():
+    """engine_rebase shape: ONE request forever, so the engine's text is
+    cumulative across answers. Each answer must still stream (and finish with)
+    only its own text -- not the session transcript."""
+    demux = _TextStreamDemux()
+    events = _feed_all(
+        demux,
+        [
+            ("A1a", None, 1),
+            ("A1a A1b", "stop", 2),  # answer 1 completes
+            ("", "length", 3),  # input-only chunks in between
+            ("A1a A1b", "stop", 2),  # re-emit of everything delivered -> ignored
+            ("A1a A1bA2a", None, 3),  # answer 2 grows the SAME cumulative
+            ("A1a A1bA2a A2b", "stop", 4),
+            ("A1a A1bA2a A2bA3a", "stop", 5),  # answer 3 arrives whole
+        ],
+    )
+    assert events == [
+        ("start",),
+        ("delta", "A1a"),
+        ("delta", " A1b"),
+        ("done", "A1a A1b"),
+        ("start",),
+        ("delta", "A2a"),
+        ("delta", " A2b"),
+        ("done", "A2a A2b"),
+        ("start",),
+        ("delta", "A3a"),
+        ("done", "A3a"),
+    ]
+    # done payloads stay flat instead of nesting (V2: 303 -> 622 -> ... -> 2687).
+    dones = [e[1] for e in events if e[0] == "done"]
+    assert not any(dones[i] in dones[i + 1] for i in range(len(dones) - 1))
+
+
+def test_demux_recovers_when_cumulative_text_is_not_a_prefix():
+    """A cumulative that drops the delivered prefix (fresh request) baselines at
+    zero rather than slicing a good answer to pieces."""
+    demux = _TextStreamDemux()
+    _feed_all(demux, [("first answer", "stop", 2)])
+    events = _feed_all(demux, [("brand new", "stop", 2)])
+    assert events == [("start",), ("delta", "brand new"), ("done", "brand new")]
 
 
 # ---------------------------------------------------------------------------
@@ -297,12 +343,21 @@ class FakeEngineClient:
         answer_gate: _AnswerGate | None = None,
         after_answer: list[tuple[str, Any, int]] | None = None,
         fail: bool = False,
+        answer_seq: list[list[str]] | None = None,
+        cumulative: bool = False,
     ) -> None:
         self._answer = answer_tokens or ["ok"]
         self._ingest_start = ingest_start
         self._answer_gate = answer_gate
         self._after_answer = after_answer or []
         self._fail = fail
+        # ``answer_seq`` gives each query its own answer; ``cumulative`` makes
+        # the engine's text request-cumulative (the engine_rebase shape: ONE
+        # request forever, so the detokenizer never resets between answers).
+        self._answer_seq = answer_seq
+        self._cumulative = cumulative
+        self._n_queries = 0
+        self._history = ""
         self.epochs = 0
         self.aborted = False  # result stream closed before it was drained
         self.calls: list[dict[str, Any]] = []
@@ -339,13 +394,18 @@ class FakeEngineClient:
                             "n_frames": 0 if video is None else int(video.shape[0]),
                             "max_tokens": sp.max_tokens,
                             "repetition_penalty": sp.repetition_penalty,
+                            "repetition_detection": sp.repetition_detection,
                         }
                     )
                     if sp.max_tokens > 1:  # query chunk -> cumulative answer
-                        last = len(self._answer) - 1
-                        for i in range(len(self._answer)):
-                            cum = " ".join(self._answer[: i + 1])
+                        toks = self._answer_seq[self._n_queries] if self._answer_seq else self._answer
+                        self._n_queries += 1
+                        last = len(toks) - 1
+                        for i in range(len(toks)):
+                            cum = self._history + " ".join(toks[: i + 1])
                             await outq.put((_omni_text(cum, "stop" if i == last else None, i + 1), i == last))
+                        if self._cumulative:
+                            self._history += " ".join(toks)
                         for cum, finish_reason, ntok in self._after_answer:
                             await outq.put((_omni_text(cum, finish_reason, ntok), False))
                     else:  # input-only -> empty-text throwaway
@@ -706,6 +766,111 @@ async def test_engine_rebase_single_request_survives_refresh_volume(monkeypatch)
     assert sum(c["text"].startswith(_SEED_PREFIX) for c in engine.chunks) == 1
     assert "session.done" in ws.sent_types()
     assert not any("refresh_at_position" in w for w in warnings)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine_rebase", [False, True])
+async def test_query_penalties_are_scoped_per_session_mode(engine_rebase: bool):
+    """Pin the penalties the driver emits per mode.
+
+    v0.26.0 scores repetition_penalty over prompt UNION output, and a streaming
+    session folds every prior answer into the prompt on each append. Refresh
+    mode re-seeds a request per epoch so its validated 1.3 stays meaningful;
+    engine_rebase mode's forever-request would instead penalize every token any
+    earlier answer used, so it drops the penalty and guards loops with
+    repetition_detection, which is scored over the current chunk's output only.
+    """
+    engine = FakeEngineClient(["ok"])
+    ws = TimedWebSocket()
+    handler = _persistent_handler(engine)
+    task = asyncio.create_task(handler.handle_session(ws))
+
+    msg = _config_msg(engine_rebase=engine_rebase)
+    if engine_rebase:
+        del msg["refresh_at_position"]
+    ws.put(msg)
+    await asyncio.sleep(0)
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg(10))})
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg(40))})
+    await _settle(ws)
+    ws.put({"type": "video.query", "text": "what happened at the beginning?"})
+    await _settle(ws)
+    ws.put({"type": "video.done"})
+    await asyncio.wait_for(task, timeout=5.0)
+
+    queries = [c for c in engine.chunks if c["max_tokens"] > 1]
+    frames = [c for c in engine.chunks if c["max_tokens"] == 1]
+    assert len(queries) == 1
+
+    if engine_rebase:
+        assert queries[0]["repetition_penalty"] == 1.0
+        assert queries[0]["repetition_detection"] == _PERSIST_QUERY_REPETITION_DETECTION
+    else:
+        assert queries[0]["repetition_penalty"] == _PERSIST_QUERY_REPETITION_PENALTY == 1.3
+        assert queries[0]["repetition_detection"] is None
+
+    # Input-only frame chunks are never penalized in either mode.
+    assert frames and all(c["repetition_penalty"] == 1.0 for c in frames)
+    assert all(c["repetition_detection"] is None for c in frames)
+
+
+@pytest.mark.asyncio
+async def test_engine_rebase_answers_are_not_request_cumulative():
+    """With ONE request forever the engine's text carries every prior answer;
+    each ``response.text.done`` must still be just that answer."""
+    engine = FakeEngineClient(
+        answer_seq=[["first", "answer"], ["second", "answer"], ["third", "answer"]],
+        cumulative=True,
+    )
+    ws = TimedWebSocket()
+    handler = _persistent_handler(engine)
+    task = asyncio.create_task(handler.handle_session(ws))
+
+    msg = _config_msg(engine_rebase=True)
+    del msg["refresh_at_position"]
+    ws.put(msg)
+    await asyncio.sleep(0)
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg(10))})
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg(40))})
+    await _settle(ws)
+    for text in ("q1?", "q2?", "q3?"):
+        ws.put({"type": "video.query", "text": text})
+        await _settle(ws)
+    ws.put({"type": "video.done"})
+    await asyncio.wait_for(task, timeout=10.0)
+
+    assert engine.epochs == 1  # single request: the cumulative really did grow
+    dones = [m["text"] for m in ws.sent if m.get("type") == "response.text.done"]
+    assert dones == ["first answer", "second answer", "third answer"]
+
+    # Deltas carry only new text, so the client never re-receives history.
+    deltas = [m["delta"] for m in ws.sent if m.get("type") == "response.text.delta"]
+    assert "".join(deltas) == "first answersecond answerthird answer"
+
+
+@pytest.mark.asyncio
+async def test_engine_error_finish_closes_the_session_with_an_error_frame():
+    """A per-request engine failure (e.g. an append past max_model_len, which
+    the scheduler now rejects instead of killing the EngineCore) must surface
+    as an error frame and a clean close, not a hang."""
+    engine = FakeEngineClient(["partial"], after_answer=[("partial", "error", 1)])
+    ws = TimedWebSocket()
+    handler = _persistent_handler(engine)
+    task = asyncio.create_task(handler.handle_session(ws))
+
+    msg = _config_msg(engine_rebase=True)
+    del msg["refresh_at_position"]
+    ws.put(msg)
+    await asyncio.sleep(0)
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg(10))})
+    await _settle(ws)
+    ws.put({"type": "video.query", "text": "q?"})
+    await asyncio.wait_for(task, timeout=10.0)
+
+    types = ws.sent_types()
+    assert "error" in types
+    assert types[-1] == "session.done"  # session closed cleanly after the error
+    assert engine.epochs == 1  # no re-seed attempt
 
 
 @pytest.mark.asyncio

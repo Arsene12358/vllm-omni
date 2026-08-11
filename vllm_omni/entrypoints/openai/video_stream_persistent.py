@@ -24,7 +24,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 from vllm import SamplingParams
 from vllm.engine.protocol import StreamingInput
 from vllm.logger import init_logger
-from vllm.sampling_params import RequestOutputKind
+from vllm.sampling_params import RepetitionDetectionParams, RequestOutputKind
 
 from vllm_omni.entrypoints.openai.video_stream_base import (
     _MAX_FRAME_SIZE,
@@ -51,7 +51,33 @@ _PERSIST_QUERY_MAX_TOKENS = 300  # default generation length for a query chunk
 # Greedy decoding in the long persistent-session context can fall into a
 # token-repetition loop after the answer ("... In In In"); a mild repetition
 # penalty makes the model emit EOS cleanly instead.
+#
+# REFRESH MODE ONLY. v0.26.0 scores repetition_penalty over prompt UNION output
+# (vllm/model_executor/layers/utils.py::apply_penalties ->
+# apply_repetition_penalties(logits, prompt_mask, output_mask, ...)), and a
+# streaming session folds every prior chunk's generated tokens into the prompt
+# on each append (vllm/v1/core/sched/scheduler.py::_update_request_as_session:
+# prompt_token_ids.extend(kept_output_tokens) then _output_token_ids.clear()).
+# Refresh mode re-seeds a fresh request per epoch, so that union stays small and
+# 1.3 does what it says — the validated short-epoch value, kept verbatim.
 _PERSIST_QUERY_REPETITION_PENALTY = 1.3
+# ENGINE-REBASE MODE. One request lives forever, so the prompt union grows
+# without bound: within a few answers it covers most of the plausible
+# vocabulary, and at temperature 0 a near-uniform 1/1.3 scaling of positive
+# logits leaves the argmax ordering untouched — except that it promotes tokens
+# the session has NEVER emitted. That is both halves of what V2 measured on
+# hardware: no anti-loop effect at all (the "In In In" loop returned despite
+# 1.3) plus a standing bias against re-using recall vocabulary a prior answer
+# already spent (the reproducible q7 opening-recall confabulation, 15/16 vs
+# refresh 16/16 in both parity rounds). So rebase mode drops the penalty and
+# guards loops with repetition_detection, which check_stop
+# (vllm/v1/core/sched/utils.py) scores over request.output_token_ids — cleared
+# on every append, i.e. exactly the answer being generated — and which never
+# touches the logits, so verbatim recall is not penalized at all. Firing it
+# ends the degenerate answer and, because the session is resumable, leaves the
+# session running (vllm/v1/core/sched/scheduler.py::_handle_stopped_request).
+# min_count=4 means four exact consecutive repeats of a 1-4 token pattern.
+_PERSIST_QUERY_REPETITION_DETECTION = RepetitionDetectionParams(min_pattern_size=1, max_pattern_size=4, min_count=4)
 # After a query chunk, ingestion pauses until the answer completes so incoming
 # frame chunks can't chop the query's decode (each session update would discard
 # the in-flight token, truncating the answer). Resume on the response, or after
@@ -111,8 +137,21 @@ class _TextStreamDemux:
     - With session pacing a query generates cleanly: the cumulative text grows
       token by token (``finish_reason`` None) until the final token, so we emit a
       ``delta`` per growth and ``done`` at the finish.
-    - A finished answer may be re-yielded by the engine -> deduped against the last
-      delivered answer.
+    - A finished answer may be re-yielded by the engine -> deduped against the
+      text delivered so far.
+
+    The text is cumulative for the LIFE OF THE ENGINE REQUEST, not per answer:
+    the output processor's detokenizer is never reset across a session's chunk
+    appends (``RequestState.apply_streaming_update`` leaves it alone), so in
+    ``engine_rebase`` mode -- one request forever -- the n-th answer arrives as
+    ``answer_1 + ... + answer_n``. Refresh mode re-seeds a request per epoch, so
+    its answers start from an empty cumulative. Both are handled by baselining
+    each answer at whatever was already delivered when it opened: a cumulative
+    that still carries the delivered prefix is segmented against it, a fresh one
+    (new request) baselines at zero. Without this, every answer re-streamed the
+    whole session transcript as deltas and its ``done`` text was the transcript
+    (V2 measured done_chars 303 -> 622 -> ... -> 2687, nesting 15/16 in rebase
+    mode vs 0/16 in refresh).
 
     The handler additionally gates these events to one answer per query (so any
     post-answer re-emit is dropped upstream regardless).
@@ -124,7 +163,8 @@ class _TextStreamDemux:
     def __init__(self) -> None:
         self._cur = ""  # cumulative text already streamed for the in-flight answer
         self._open = False  # response.start emitted for the in-flight answer
-        self._last_answer: str | None = None  # last fully-delivered answer (dedup re-emits)
+        self._base = ""  # cumulative text the in-flight answer is measured against
+        self._delivered = ""  # cumulative text through the last delivered answer
 
     def feed(self, cum: str, finish_reason: Any, ntok: int) -> list[tuple]:
         cum = cum or ""
@@ -132,19 +172,22 @@ class _TextStreamDemux:
             return []  # input-only / empty output -> ignore
         events: list[tuple] = []
         if not self._open:
-            if cum == self._last_answer:
-                return []  # re-emit of the delivered answer -> ignore
+            if cum == self._delivered:
+                return []  # re-emit of what was already delivered -> ignore
             self._open = True
-            self._cur = ""
+            self._base = self._delivered if cum.startswith(self._delivered) else ""
+            self._cur = self._base
             events.append(("start",))
         delta = cum[len(self._cur) :] if cum.startswith(self._cur) else cum
         if delta:
             events.append(("delta", delta))
         self._cur = cum
         if finish_reason is not None:
-            events.append(("done", cum))
-            self._last_answer = cum
+            answer = cum[len(self._base) :] if cum.startswith(self._base) else cum
+            events.append(("done", answer))
+            self._delivered = cum
             self._open = False
+            self._base = ""
             self._cur = ""
         return events
 
@@ -339,7 +382,10 @@ async def run_persistent_session(
         chunks = max(1, (n_frames + _PERSIST_FRAMES_PER_CHUNK - 1) // _PERSIST_FRAMES_PER_CHUNK)
         return chunks * _PERSIST_EST_POS_PER_CHUNK
 
-    def _chunk(text: str, frames: list | None, max_tokens: int, rep_penalty: float = 1.0) -> StreamingInput:
+    def _chunk(text: str, frames: list | None, max_tokens: int, *, query: bool = False) -> StreamingInput:
+        # Penalty scoping is mode-dependent — see the module constants: refresh
+        # mode's per-epoch request keeps repetition_penalty meaningful, while
+        # rebase mode's forever-request needs an output-scoped guard instead.
         prompt: dict[str, Any] = {"prompt": text}
         if frames:
             prompt["multi_modal_data"] = {"video": np.stack(frames, axis=0)}
@@ -349,7 +395,8 @@ async def run_persistent_session(
                 temperature=0.0,
                 max_tokens=max_tokens,
                 seed=42,
-                repetition_penalty=rep_penalty,
+                repetition_penalty=(_PERSIST_QUERY_REPETITION_PENALTY if query and not engine_rebase else 1.0),
+                repetition_detection=(_PERSIST_QUERY_REPETITION_DETECTION if query and engine_rebase else None),
                 output_kind=RequestOutputKind.CUMULATIVE,
             ),
         )
@@ -421,12 +468,7 @@ async def run_persistent_session(
                     _, text, maxt = ev
                     query_done_event.clear()
                     expecting_answer["v"] = True
-                    yield _chunk(
-                        _qwen_query_suffix(text),
-                        None,
-                        maxt,
-                        _PERSIST_QUERY_REPETITION_PENALTY,
-                    )
+                    yield _chunk(_qwen_query_suffix(text), None, maxt, query=True)
                     # Pause ingestion until the answer completes (or times out)
                     # so frame chunks don't truncate the query's decode.
                     try:
@@ -456,6 +498,23 @@ async def run_persistent_session(
             if state is None:
                 continue
             cum, finish_reason, ntok = state
+            if finish_reason == "error":
+                # The engine failed this request on its own — a session append
+                # that would cross max_model_len is rejected per-request (the
+                # scheduler's streaming-overflow guard) rather than taking the
+                # EngineCore down. The engine is fine; only this session is
+                # over, so report it and let the epoch close cleanly.
+                logger.error(
+                    "persistent session: the engine ended the request with an error "
+                    "(see the engine log for the reason); closing the session"
+                )
+                done_event.set()
+                query_done_event.set()
+                try:
+                    await handler._send_error(websocket, "Persistent session ended by the engine")
+                except Exception:
+                    logger.debug("persistent session: could not send the engine error", exc_info=True)
+                return
             for ev in demux.feed(cum, finish_reason, ntok):
                 # Deliver exactly one answer per query; suppress trailing
                 # re-emits / degeneration once the answer is delivered.
