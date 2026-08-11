@@ -129,6 +129,10 @@ def test_mid_step_stop_trims_logprob_rows_with_token_ids() -> None:
         finished_req_ids_dict=defaultdict(set),
         kv_cache_manager=SimpleNamespace(take_events=lambda: None),
         kv_event_publisher=SimpleNamespace(publish=lambda _events: None),
+        # update_from_output drains the base scheduler's deferred error sets
+        # (grammar failures, streaming sessions rejected at max_model_len);
+        # nothing is pending in these cases.
+        _drain_deferred_error_reqs=lambda _outputs: None,
     )
 
     def update_request_trimming(req, token_ids):
@@ -208,6 +212,10 @@ def test_invalid_logprobs_finish_only_the_affected_scheduler_request() -> None:
         finished_req_ids_dict=defaultdict(set),
         kv_cache_manager=SimpleNamespace(take_events=lambda: None),
         kv_event_publisher=SimpleNamespace(publish=lambda _events: None),
+        # update_from_output drains the base scheduler's deferred error sets
+        # (grammar failures, streaming sessions rejected at max_model_len);
+        # nothing is pending in these cases.
+        _drain_deferred_error_reqs=lambda _outputs: None,
     )
     update_calls: list[str] = []
 

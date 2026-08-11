@@ -13,6 +13,7 @@ import asyncio
 import base64
 import io
 import json
+import logging
 import re
 from typing import Any
 
@@ -250,7 +251,12 @@ def _shade(video, index: int) -> int:
     return int(video[index, 0, 0, 0])
 
 
-def _omni_text(cum: str, finish_reason: Any = None, ntok: int | None = None) -> OmniRequestOutput:
+def _omni_text(
+    cum: str,
+    finish_reason: Any = None,
+    ntok: int | None = None,
+    stop_reason: Any = None,
+) -> OmniRequestOutput:
     """Text OmniRequestOutput carrying cumulative text + finish_reason + token_ids."""
 
     class Output:
@@ -262,6 +268,7 @@ def _omni_text(cum: str, finish_reason: Any = None, ntok: int | None = None) -> 
     output = Output()
     output.text = cum
     output.finish_reason = finish_reason
+    output.stop_reason = stop_reason
     output.token_ids = list(range(ntok if ntok is not None else len(cum.split())))
     request_output = RequestOutput()
     request_output.outputs = [output]
@@ -345,6 +352,7 @@ class FakeEngineClient:
         fail: bool = False,
         answer_seq: list[list[str]] | None = None,
         cumulative: bool = False,
+        answer_finish_reason: str = "stop",
     ) -> None:
         self._answer = answer_tokens or ["ok"]
         self._ingest_start = ingest_start
@@ -358,6 +366,7 @@ class FakeEngineClient:
         self._cumulative = cumulative
         self._n_queries = 0
         self._history = ""
+        self._answer_finish_reason = answer_finish_reason
         self.epochs = 0
         self.aborted = False  # result stream closed before it was drained
         self.calls: list[dict[str, Any]] = []
@@ -403,11 +412,20 @@ class FakeEngineClient:
                         last = len(toks) - 1
                         for i in range(len(toks)):
                             cum = self._history + " ".join(toks[: i + 1])
-                            await outq.put((_omni_text(cum, "stop" if i == last else None, i + 1), i == last))
+                            await outq.put(
+                                (
+                                    _omni_text(
+                                        cum,
+                                        self._answer_finish_reason if i == last else None,
+                                        i + 1,
+                                    ),
+                                    i == last,
+                                )
+                            )
                         if self._cumulative:
                             self._history += " ".join(toks)
-                        for cum, finish_reason, ntok in self._after_answer:
-                            await outq.put((_omni_text(cum, finish_reason, ntok), False))
+                        for entry in self._after_answer:
+                            await outq.put((_omni_text(*entry), False))
                     else:  # input-only -> empty-text throwaway
                         await outq.put((_omni_text("", "length", 1), False))
             finally:
@@ -871,6 +889,58 @@ async def test_engine_error_finish_closes_the_session_with_an_error_frame():
     assert "error" in types
     assert types[-1] == "session.done"  # session closed cleanly after the error
     assert engine.epochs == 1  # no re-seed attempt
+
+
+@pytest.mark.asyncio
+async def test_engine_error_frame_carries_the_engine_stop_reason():
+    """The engine explains the failure in stop_reason (e.g. which limit was hit);
+    the client must get that, not a generic message."""
+    reason = "session prompt would reach 4097 tokens, past max_model_len of 4096"
+    engine = FakeEngineClient(["partial"], after_answer=[("partial", "error", 1, reason)])
+    ws = TimedWebSocket()
+    handler = _persistent_handler(engine)
+    task = asyncio.create_task(handler.handle_session(ws))
+
+    msg = _config_msg(engine_rebase=True)
+    del msg["refresh_at_position"]
+    ws.put(msg)
+    await asyncio.sleep(0)
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg(10))})
+    await _settle(ws)
+    ws.put({"type": "video.query", "text": "q?"})
+    await asyncio.wait_for(task, timeout=10.0)
+
+    errors = [m for m in ws.sent if m.get("type") == "error"]
+    assert len(errors) == 1
+    assert "max_model_len" in errors[0]["message"]
+
+
+@pytest.mark.asyncio
+async def test_repetition_guard_firing_is_logged_with_a_stable_needle(caplog):
+    """A repetition-truncated answer must be distinguishable in a transcript
+    from a genuinely short one, or a quality regression hides as a good run."""
+    engine = FakeEngineClient(["loop", "loop", "loop"], answer_finish_reason="repetition")
+    ws = TimedWebSocket()
+    handler = _persistent_handler(engine)
+
+    with caplog.at_level(logging.INFO):
+        task = asyncio.create_task(handler.handle_session(ws))
+        msg = _config_msg(engine_rebase=True)
+        del msg["refresh_at_position"]
+        ws.put(msg)
+        await asyncio.sleep(0)
+        ws.put({"type": "video.frame", "data": _b64(_make_jpeg(10))})
+        await _settle(ws)
+        ws.put({"type": "video.query", "text": "q?"})
+        await _settle(ws)
+        ws.put({"type": "video.done"})
+        await asyncio.wait_for(task, timeout=10.0)
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert sum(video_stream_persistent._PERSIST_REPETITION_NEEDLE in m for m in messages) == 1
+    # The truncated answer is still delivered to the client.
+    dones = [m for m in ws.sent if m.get("type") == "response.text.done"]
+    assert dones and dones[0]["text"] == "loop loop loop"
 
 
 @pytest.mark.asyncio

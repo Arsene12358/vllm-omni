@@ -592,6 +592,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.waiting.remove_requests(stopped_preempted_reqs)
             self.skipped_waiting.remove_requests(stopped_preempted_reqs)
 
+        # [Upstream compat] Drain the base scheduler's deferred per-request
+        # error sets. This override never calls super().update_from_output, so
+        # without this a grammar failure or a streaming session rejected at
+        # max_model_len would stay parked forever and hang its client.
+        self._drain_deferred_error_reqs(outputs)
+
         # [Main] Handle failed KV load requests
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
             requests = [self.requests[req_id] for req_id in failed_kv_load_req_ids]

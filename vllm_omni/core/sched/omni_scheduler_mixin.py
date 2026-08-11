@@ -51,6 +51,42 @@ class OmniSchedulerMixin:
         if input_coordinator is not None:
             input_coordinator.free_finished_request(request_id)
 
+    def _drain_deferred_error_reqs(self, outputs: dict[int, list]) -> None:
+        """Finish the requests the base scheduler defers to update_from_output.
+
+        The omni schedulers re-implement ``update_from_output`` instead of
+        calling ``super()``, so the base class's deferred per-request error sets
+        are only drained if we drain them here. Left undrained, the request is
+        never finished and never emits an output: the client waits forever.
+
+        Covers grammar-compilation failures and streaming sessions whose next
+        input chunk would cross ``max_model_len`` (the latter is how a
+        long-lived video session ends instead of killing the EngineCore).
+        """
+        from vllm_omni.engine import OmniEngineCoreOutput
+
+        error_req_ids: set[str] = set()
+        for attr in ("grammar_compile_error_reqs", "streaming_overflow_error_reqs"):
+            # getattr for the __new__-constructed schedulers used in tests.
+            pending = getattr(self, attr, None)
+            if pending:
+                error_req_ids.update(pending)
+                pending.clear()
+        if not error_req_ids:
+            return
+
+        for request in self.finish_requests(error_req_ids, RequestStatus.FINISHED_ERROR):
+            outputs[request.client_index].append(
+                OmniEngineCoreOutput(
+                    request_id=request.request_id,
+                    new_token_ids=[],
+                    finish_reason=request.get_finished_reason(),
+                    stop_reason=request.stop_reason,
+                    events=request.take_events(),
+                    trace_headers=request.trace_headers,
+                )
+            )
+
     def _replace_streaming_session(self, session: Request, update: StreamingUpdate) -> None:
         """Replace a downstream stage's placeholder with its next payload."""
         adapter = getattr(self, "chunk_transfer_adapter", None)

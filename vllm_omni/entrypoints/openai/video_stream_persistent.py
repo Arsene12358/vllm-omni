@@ -78,6 +78,11 @@ _PERSIST_QUERY_REPETITION_PENALTY = 1.3
 # session running (vllm/v1/core/sched/scheduler.py::_handle_stopped_request).
 # min_count=4 means four exact consecutive repeats of a 1-4 token pattern.
 _PERSIST_QUERY_REPETITION_DETECTION = RepetitionDetectionParams(min_pattern_size=1, max_pattern_size=4, min_count=4)
+# Stable log needles. Validation harnesses grep these, so treat them as a
+# contract: a truncated answer must be distinguishable from a short one, and an
+# engine-side session failure from a normal close.
+_PERSIST_REPETITION_NEEDLE = "[persistent-session] repetition guard fired"
+_PERSIST_ENGINE_ERROR_NEEDLE = "[persistent-session] engine ended the request with an error"
 # After a query chunk, ingestion pauses until the answer completes so incoming
 # frame chunks can't chop the query's decode (each session update would discard
 # the in-flight token, truncating the answer). Resume on the response, or after
@@ -192,8 +197,10 @@ class _TextStreamDemux:
         return events
 
 
-def _text_output_state(output: OmniRequestOutput) -> tuple[str, Any, int] | None:
-    """Pull (cumulative_text, finish_reason, n_tokens) from a text output."""
+def _text_output_state(
+    output: OmniRequestOutput,
+) -> tuple[str, Any, int, Any] | None:
+    """Pull (cumulative_text, finish_reason, n_tokens, stop_reason) from a text output."""
     if getattr(output, "final_output_type", "text") != "text":
         return None
     request_output = getattr(output, "request_output", None)
@@ -207,7 +214,10 @@ def _text_output_state(output: OmniRequestOutput) -> tuple[str, Any, int] | None
     finish_reason = getattr(completion, "finish_reason", None)
     token_ids = getattr(completion, "token_ids", None)
     ntok = len(token_ids) if token_ids is not None else 0
-    return (text, finish_reason, ntok)
+    # The engine explains a per-request failure here (e.g. the session prompt
+    # crossing max_model_len), so carry it through to the client.
+    stop_reason = getattr(completion, "stop_reason", None)
+    return (text, finish_reason, ntok, stop_reason)
 
 
 class _ClientGoneError(Exception):
@@ -497,24 +507,27 @@ async def run_persistent_session(
             state = _text_output_state(output)
             if state is None:
                 continue
-            cum, finish_reason, ntok = state
+            cum, finish_reason, ntok, stop_reason = state
             if finish_reason == "error":
                 # The engine failed this request on its own — a session append
                 # that would cross max_model_len is rejected per-request (the
                 # scheduler's streaming-overflow guard) rather than taking the
                 # EngineCore down. The engine is fine; only this session is
                 # over, so report it and let the epoch close cleanly.
-                logger.error(
-                    "persistent session: the engine ended the request with an error "
-                    "(see the engine log for the reason); closing the session"
-                )
+                detail = str(stop_reason) if stop_reason else "see the engine log for the reason"
+                logger.error("%s: %s", _PERSIST_ENGINE_ERROR_NEEDLE, detail)
                 done_event.set()
                 query_done_event.set()
                 try:
-                    await handler._send_error(websocket, "Persistent session ended by the engine")
+                    await handler._send_error(websocket, f"Persistent session ended by the engine: {detail}")
                 except Exception:
                     logger.debug("persistent session: could not send the engine error", exc_info=True)
                 return
+            if finish_reason == "repetition":
+                # The anti-loop guard fired: this answer was cut short at a
+                # degenerate repeat, so the transcript is truncated by design and
+                # must not read as a model-quality result.
+                logger.info("%s: answer truncated after %d tokens", _PERSIST_REPETITION_NEEDLE, ntok)
             for ev in demux.feed(cum, finish_reason, ntok):
                 # Deliver exactly one answer per query; suppress trailing
                 # re-emits / degeneration once the answer is delivered.

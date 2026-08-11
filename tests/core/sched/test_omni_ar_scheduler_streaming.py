@@ -33,6 +33,10 @@ def _make_scheduler(*, stage_id: int = 0) -> OmniARScheduler:
     sched.log_stats = False
     sched.chunk_transfer_adapter = None
     sched.skipped_waiting = set()
+    # The base _update_request_as_session rejects appends that would push the
+    # session past max_model_len; these cases stay far below it.
+    sched.max_model_len = 1 << 20
+    sched.streaming_overflow_error_reqs = set()
     return sched
 
 
