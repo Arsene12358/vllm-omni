@@ -666,7 +666,15 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         # Handle failed KV load requests
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
-            requests = [self.requests[req_id] for req_id in failed_kv_load_req_ids]
+            # `.get`, not `[...]`: the drain above finishes (and frees) the
+            # deferred error requests, so an id that is in BOTH sets is already
+            # out of self.requests by now — indexing it would take the whole
+            # EngineCore down. It has its error output already; skip it.
+            requests = [
+                request
+                for req_id in failed_kv_load_req_ids
+                if (request := self.requests.get(req_id)) is not None
+            ]
             self.finish_requests(failed_kv_load_req_ids, RequestStatus.FINISHED_ERROR)
             for request in requests:
                 outputs[request.client_index].append(

@@ -600,7 +600,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         # [Main] Handle failed KV load requests
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
-            requests = [self.requests[req_id] for req_id in failed_kv_load_req_ids]
+            # `.get`, not `[...]`: the drain above finishes (and frees) the
+            # deferred error requests, so an id that is in BOTH sets is already
+            # out of self.requests by now — indexing it would take the whole
+            # EngineCore down. It has its error output already; skip it.
+            requests = [
+                request
+                for req_id in failed_kv_load_req_ids
+                if (request := self.requests.get(req_id)) is not None
+            ]
             self.finish_requests(failed_kv_load_req_ids, RequestStatus.FINISHED_ERROR)
             for request in requests:
                 outputs[request.client_index].append(
@@ -783,6 +791,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         Discards the last sampled output token from the prior input chunk at stage 0.
         """
+        # NOTE: everything below runs BEFORE super()'s max_model_len check,
+        # which can reject this append and leave the session parked for the
+        # error drain (and before its sticky-rejection early return on a later
+        # append). Reviewed and left as is: a rejected session is finished with
+        # FinishReason.ERROR and freed without ever being scheduled again, so
+        # the discarded async token and the rewound num_computed_tokens are
+        # never read, and _new_prompt_len_snapshot is popped in _free_request.
+        # On the sticky path num_output_placeholders is already 0 (nothing was
+        # scheduled), so the rewind block does not even run.
         req_id = session.request_id
         self._new_prompt_len_snapshot[req_id] = len(update.prompt_token_ids)
         outstanding_async_tokens = getattr(session, "num_output_placeholders", 0)

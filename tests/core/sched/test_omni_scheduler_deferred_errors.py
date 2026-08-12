@@ -14,12 +14,17 @@ a clean per-request error back into a silent hang.
 Behaviour is pinned on the shared helper; placement (that both overrides
 actually call it) is pinned separately, because driving a full
 ``update_from_output`` needs a model runner output and a live KV cache manager.
+
+The drain also runs immediately before the failed-KV-load block, which used to
+index ``self.requests[req_id]`` — so a request in BOTH sets (drained and freed,
+then looked up again) killed the EngineCore. That window is pinned at the end.
 """
 
 from __future__ import annotations
 
 import inspect
 from collections import defaultdict
+from types import SimpleNamespace
 
 import pytest
 from vllm.v1.engine import FinishReason
@@ -123,3 +128,81 @@ def test_update_from_output_drains_deferred_errors(scheduler_cls):
     never emptied and the session hangs."""
     source = inspect.getsource(scheduler_cls.update_from_output)
     assert "_drain_deferred_error_reqs" in source
+
+
+# ---------------------------------------------------------------------------
+# The drain -> failed-KV-load window
+# ---------------------------------------------------------------------------
+class _PastTheBlockError(Exception):
+    """Raised from the first call after the failed-KV-load block, so the test
+    can drive the real method through the window and stop there instead of
+    stubbing the whole tail of update_from_output."""
+
+
+def _stub_for_update_from_output(scheduler_cls, request, finish_calls):
+    """A ``__new__`` scheduler stubbed just far enough to run
+    ``update_from_output`` from its head through the failed-KV-load block."""
+    scheduler = scheduler_cls.__new__(scheduler_cls)
+    scheduler.perf_metrics = None
+    scheduler.requests = {request.request_id: request}
+    scheduler.recompute_kv_load_failures = False
+    # The same id in both sets: the deferred error set the drain empties, and
+    # the KV-load failures reported by the connector this step.
+    scheduler.streaming_overflow_error_reqs = {request.request_id}
+    scheduler.grammar_compile_error_reqs = set()
+    scheduler.chunk_transfer_adapter = None
+    scheduler._pending_finish_reqs = []
+    scheduler._handle_invalid_blocks = lambda _blocks, _scheduled: {request.request_id}
+
+    def _finish_requests(req_ids, status):
+        # Mirror the base scheduler: unknown ids are skipped, and finishing a
+        # request frees it out of self.requests.
+        req_ids = set(req_ids)
+        finish_calls.append(req_ids)
+        return [scheduler.requests.pop(r) for r in req_ids if r in scheduler.requests]
+
+    scheduler.finish_requests = _finish_requests
+
+    def _past_the_block(*_args, **_kwargs):
+        raise _PastTheBlockError
+
+    scheduler._update_from_kv_xfer_finished = _past_the_block
+    return scheduler
+
+
+def _model_runner_output():
+    return SimpleNamespace(
+        sampled_token_ids=[],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=None,
+        num_nans_in_logits=None,
+        cudagraph_stats=None,
+        req_id_to_index={},
+        kv_extracted_req_ids=None,
+        kv_connector_output=SimpleNamespace(invalid_block_ids={7}),
+    )
+
+
+@pytest.mark.parametrize("scheduler_cls", _SCHEDULER_PARAMS)
+def test_failed_kv_load_survives_a_request_the_drain_just_freed(scheduler_cls):
+    """A request can legitimately be in both sets in one step: a streaming
+    session rejected at max_model_len (or a grammar failure) whose blocks the
+    connector also failed to load. The drain finishes and frees it first, so
+    the failed-KV-load block must look it up defensively — indexing
+    ``self.requests[req_id]`` raises KeyError out of ``update_from_output``,
+    which is not caught anywhere and takes the EngineCore down with it."""
+    request = _StubRequest("session", stop_reason="... max_model_len of 4096 ...")
+    finish_calls: list[set[str]] = []
+    scheduler = _stub_for_update_from_output(scheduler_cls, request, finish_calls)
+
+    # Reaching the sentinel means the window was crossed without KeyError.
+    with pytest.raises(_PastTheBlockError):
+        scheduler.update_from_output(
+            SimpleNamespace(num_scheduled_tokens={}), _model_runner_output()
+        )
+
+    # Drained first (emitting the error output), then asked for again by the
+    # failed-KV-load block, which finds nothing left to report.
+    assert finish_calls == [{"session"}, {"session"}]
+    assert "session" not in scheduler.requests

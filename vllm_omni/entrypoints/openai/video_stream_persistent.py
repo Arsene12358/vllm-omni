@@ -292,7 +292,13 @@ async def run_persistent_session(
             config.refresh_at_position,
         )
     if opening_size == 0:
-        logger.warning("persistent mode with sink_frames=0: opening recall not preserved across refresh")
+        logger.warning(
+            "persistent mode with sink_frames=0: %s",
+            "opening retention now relies entirely on the engine's sink pinning "
+            "(--streaming-kv-start-size), since the driver re-seeds nothing"
+            if engine_rebase
+            else "opening recall not preserved across refresh",
+        )
 
     # Ordered event stream from the WS reader, preserving receive order:
     #   ("frame", ndarray) | ("query", text, max_tokens) | ("done",)
@@ -597,6 +603,18 @@ async def run_persistent_session(
                 # returns on done_event, so reaching here without it (an
                 # engine-side stream end) closes the session instead of
                 # re-seeding a second request the mode promises never to make.
+                if not done_event.is_set():
+                    # Not the reported-error path (that one sets done_event
+                    # before returning): the engine ended this session's one
+                    # request quietly -- a length cap, an abort -- while the
+                    # client was still feeding. Silent otherwise, because the
+                    # break below just closes the session.
+                    logger.warning(
+                        "engine_rebase session: the engine's stream ended while the client "
+                        "was still feeding; closing the session instead of re-seeding a "
+                        "second request. Check the server log for this request's finish "
+                        "reason (e.g. a length cap or an abort)"
+                    )
                 break
             epoch += 1
         try:

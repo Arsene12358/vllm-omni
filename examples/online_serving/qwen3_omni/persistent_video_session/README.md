@@ -133,11 +133,11 @@ python demo_client.py --video your_clip.mp4 --port 8901 \
 
 | Signal | Measured |
 |---|---|
-| rebase event cost | **~7.7–7.8 ms/event** at the shipped production geometry (rotating the 8,192-token recent window across 48 layers; median-of-5, reproduced across 5 jobs). One event per ~38,400 positions ≈ ~28 min of 2 fps video — it hides under a single video-chunk step |
+| rebase event cost | **~7.7–7.8 ms/event** at the shipped production geometry (rotating the 8,192-token recent window across 48 layers; median-of-5, reproduced across 5 jobs). One event per ~38,400 positions ≈ **~14 min of 2 fps video** (measured cadence 833–843 s across 8 production-geometry events; the ~28 min figure assumed the 2-frame/item floor, which a live-paced feed does not reach) — it hides under a single video-chunk step |
 | positions stay bounded | max effective position **49,154 < 65,536** across a 2 h 12 m production-geometry soak: 8 rebases, one request end-to-end, KV `alive` flat at 672–673 over 15,073 evictions |
 | opening recall across rebases | soak probes 4/4 through 8 rebases; answer-recall parity vs refresh mode **16/16 vs 16/16** (no recall regression); 64/64 post-rebase recalls in the multi-stream wave |
 | steady-state decode | **221.5 tok/s** per-answer median in rebase mode — with rebases firing mid-run — vs the **213 tok/s** refresh-mode baseline (unchanged within noise) |
-| concurrent rebase sessions | **4 streams × ~35 min each on one server** (`--max-num-seqs 4`, live-paced feeds): **16 rebases per stream**, per-stream KV bands flat and independent, every stream recalls its **own** opening with zero cross-stream contamination, 4/4 clean closes, no cross-stream stall around any rebase event |
+| concurrent rebase sessions | **4 streams × ~35 min each on one server** (`--max-num-seqs 4`, live-paced feeds, on a **tiny-R geometry — start 640 / recent 2048 / rebase-at 8192** — so rebases fire ~every 2 min instead of ~14): **16 rebases per stream**, per-stream KV bands flat and independent, every stream recalls its **own** opening with zero cross-stream contamination, 4/4 clean closes, no cross-stream stall around any rebase event. Answer latency stays at a 1.4–1.9 s median per stream, with **maxima of 35–42 s** when all four streams' answer decodes and chunk prefills coincide (time-sharing under CUDA graphs — bounded and correct, no guard or timeout hits) |
 
 (Full evidence: the validation report's V2 soak/parity and V3 multi-stream tables.)
 
